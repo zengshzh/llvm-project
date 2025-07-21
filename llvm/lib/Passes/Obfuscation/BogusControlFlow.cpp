@@ -265,7 +265,7 @@ void BogusControlFlowPass::addBogusFlow(BasicBlock *basicBlock, Function &F) {
   // part, because they actually are updated in the second part according to
   // them.
   BasicBlock::iterator i1 = basicBlock->begin();
-  if (basicBlock->getFirstNonPHIOrDbgOrLifetime())
+  if (basicBlock->getFirstNonPHIOrDbgOrLifetime() != basicBlock->end())
     i1 = (BasicBlock::iterator)basicBlock->getFirstNonPHIOrDbgOrLifetime();
   Twine *var;
   var = new Twine("originalBB");
@@ -296,7 +296,7 @@ void BogusControlFlowPass::addBogusFlow(BasicBlock *basicBlock, Function &F) {
   // The always true condition. End of the first block
   Twine *var4 = new Twine("condition");
   FCmpInst *condition =
-      new FCmpInst(*basicBlock, FCmpInst::FCMP_TRUE, LHS, RHS, *var4);
+      new FCmpInst(basicBlock, FCmpInst::FCMP_TRUE, LHS, RHS, *var4);
   DEBUG_WITH_TYPE("gen", errs() << "bcf: Always true condition created\n");
 
   // Jump to the original basic block if the condition is true or
@@ -332,7 +332,7 @@ void BogusControlFlowPass::addBogusFlow(BasicBlock *basicBlock, Function &F) {
   // We add at the end a new always true condition
   Twine *var6 = new Twine("condition2");
   FCmpInst *condition2 =
-      new FCmpInst(*originalBB, CmpInst::FCMP_TRUE, LHS, RHS, *var6);
+      new FCmpInst(originalBB, CmpInst::FCMP_TRUE, LHS, RHS, *var6);
   BranchInst::Create(originalBBpart2, alteredBB, (Value *)condition2,
                      originalBB);
   DEBUG_WITH_TYPE("gen", errs()
@@ -426,19 +426,19 @@ BasicBlock *createAlteredBasicBlock(BasicBlock *basicBlock, const Twine &Name,
           case 0:                                    // do nothing
             break;
           case 1:
-            op = BinaryOperator::CreateNeg(i->getOperand(0), *var, &*i);
+            op = BinaryOperator::CreateNeg(i->getOperand(0), *var, i->getIterator());
             op1 = BinaryOperator::Create(Instruction::Add, op,
-                                          i->getOperand(1), "gen", &*i);
+                                          i->getOperand(1), "gen", i->getIterator());
             break;
           case 2:
             op1 = BinaryOperator::Create(Instruction::Sub, i->getOperand(0),
-                                          i->getOperand(1), *var, &*i);
+                                          i->getOperand(1), *var, i->getIterator());
             op = BinaryOperator::Create(Instruction::Mul, op1,
-                                        i->getOperand(1), "gen", &*i);
+                                        i->getOperand(1), "gen", i->getIterator());
             break;
           case 3:
             op = BinaryOperator::Create(Instruction::Shl, i->getOperand(0),
-                                        i->getOperand(1), *var, &*i);
+                                        i->getOperand(1), *var, i->getIterator());
             break;
           }
         }
@@ -453,15 +453,15 @@ BasicBlock *createAlteredBasicBlock(BasicBlock *basicBlock, const Twine &Name,
           case 0:                                    // do nothing
             break;
           case 1:
-            op2 = UnaryOperator::CreateFNeg(i->getOperand(0),*var,&*i);
+            op2 = UnaryOperator::CreateFNeg(i->getOperand(0),*var,i->getIterator());
             op1 = BinaryOperator::Create(Instruction::FAdd,op2,
-                          i->getOperand(1),"gen",&*i);
+                          i->getOperand(1),"gen",i->getIterator());
             break;
           case 2:
             op = BinaryOperator::Create(Instruction::FSub, i->getOperand(0),
-                                        i->getOperand(1), *var, &*i);
+                                        i->getOperand(1), *var, i->getIterator());
             op1 = BinaryOperator::Create(Instruction::FMul, op,
-                                          i->getOperand(1), "gen", &*i);
+                                          i->getOperand(1), "gen", i->getIterator());
             break;
           }
         }

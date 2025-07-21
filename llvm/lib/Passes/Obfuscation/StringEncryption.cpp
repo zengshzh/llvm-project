@@ -122,7 +122,7 @@ bool StringEncryptionPass::do_StrEnc(Module &M, ModuleAnalysisManager &AM) {
 
 PreservedAnalyses StringEncryptionPass::run(Module &M, ModuleAnalysisManager &AM) {
   if (this->flag) {
-    outs() << "[Soule] force.run.StringEncryptionPass\n";
+    outs() << "[obf] force.run.StringEncryptionPass\n";
     if (do_StrEnc(M, AM))
       return PreservedAnalyses::none();
   }
