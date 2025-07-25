@@ -18,6 +18,7 @@ PreservedAnalyses FlatteningPass::run(Function& F, FunctionAnalysisManager& AM) 
       INIT_CONTEXT(F);
       // outs()<<"[Soule] debug. "<< F.getName()<<" \n";
       if (flatten(*tmp)) {
+        outs()<<"[obf] flattening. "<< F.getName()<<" \n";
         ++Flattened;
       }
       return PreservedAnalyses::none();
