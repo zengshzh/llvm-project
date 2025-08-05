@@ -583,10 +583,10 @@ bool BogusControlFlowPass::doF(Module &M, Function &F) {
 
   GlobalVariable *x =
       new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                         GlobalValue::CommonLinkage, (Constant *)x1, *varX);
+                         GlobalValue::InternalLinkage, (Constant *)x1, *varX);
   GlobalVariable *y =
       new GlobalVariable(M, Type::getInt32Ty(M.getContext()), false,
-                         GlobalValue::CommonLinkage, (Constant *)y1, *varY);
+                         GlobalValue::InternalLinkage, (Constant *)y1, *varY);
 
   std::vector<Instruction *> toEdit, toDelete;
   BinaryOperator *op, *op1 = NULL;
