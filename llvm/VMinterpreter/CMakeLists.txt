@@ -11,6 +11,7 @@ set(VMINTERPRETER_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Source files
 set(VMINTERPRETER_SOURCES
     src/vmprint.c
+    src/vmexecute.c
 )
 
 # Static library (no LLVM dependency)
