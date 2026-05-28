@@ -46,6 +46,7 @@ add_llvm_component_library(LLVMipo
   SCCP.cpp
   StripDeadPrototypes.cpp
   StripSymbols.cpp
+  VMCodeGen.cpp
   ThinLTOBitcodeWriter.cpp
   WholeProgramDevirt.cpp
 

@@ -74,6 +74,7 @@
 #include "llvm/Transforms/IPO/SCCP.h"
 #include "llvm/Transforms/IPO/SampleProfile.h"
 #include "llvm/Transforms/IPO/SampleProfileProbe.h"
+#include "llvm/Transforms/IPO/VMCodeGen.h"
 #include "llvm/Transforms/IPO/WholeProgramDevirt.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Instrumentation/AllocToken.h"
@@ -1754,6 +1755,9 @@ PassBuilder::buildPerModuleDefaultPipeline(OptimizationLevel Level,
   if (Phase == ThinOrFullLTOPhase::None)
     MPM.addPass(MemProfRemoveInfo());
 
+  // VMCodeGen: Insert VMInterpreter for VMP-annotated functions.
+  MPM.addPass(VMCodeGenPass());
+
   // Convert @llvm.global.annotations to !annotation metadata.
   MPM.addPass(Annotation2MetadataPass());
 
@@ -1848,6 +1852,9 @@ PassBuilder::buildThinLTOPreLinkDefaultPipeline(OptimizationLevel Level) {
   ModulePassManager MPM;
 
   instructionCountersPass(MPM, /* IsPreOptimization */ true);
+
+  // VMCodeGen: Insert VMInterpreter for VMP-annotated functions.
+  MPM.addPass(VMCodeGenPass());
 
   // Convert @llvm.global.annotations to !annotation metadata.
   MPM.addPass(Annotation2MetadataPass());
@@ -2407,6 +2414,9 @@ PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
   }
 
   invokePipelineEarlySimplificationEPCallbacks(MPM, Level, Phase);
+
+  // VMCodeGen: Insert VMInterpreter for VMP-annotated functions.
+  MPM.addPass(VMCodeGenPass());
 
   // Build a minimal pipeline based on the semantics required by LLVM,
   // which is just that always inlining occurs. Further, disable generating
