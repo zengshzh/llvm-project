@@ -82,3 +82,5 @@ add_llvm_component_library(LLVMipo
   Vectorize
   Instrumentation
   )
+
+target_include_directories(LLVMipo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../../VMinterpreter/include)

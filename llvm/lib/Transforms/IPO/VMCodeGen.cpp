@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/IPO/VMCodeGen.h"
+#include "vminterpreter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
@@ -28,21 +29,6 @@
 using namespace llvm;
 
 #define DEBUG_TYPE "vm-codegen"
-
-//===----------------------------------------------------------------------===//
-// VM bytecode opcodes
-//===----------------------------------------------------------------------===//
-enum VMOpcode : uint8_t {
-  VM_ALLOCA = 0x00,
-  VM_LOAD   = 0x01,
-  VM_STORE  = 0x02,
-  VM_LI     = 0x03,
-  VM_ADD    = 0x10,
-  VM_SUB    = 0x11,
-  VM_MUL    = 0x12,
-  VM_UDIV   = 0x13,
-  VM_RET    = 0x20,
-};
 
 //===----------------------------------------------------------------------===//
 // Annotation detection
@@ -104,26 +90,6 @@ static void emitInsn(std::vector<uint8_t> &BC, uint8_t Op, uint16_t Dst,
 // Translate IR function to VM bytecode
 //===----------------------------------------------------------------------===//
 
-// AllocaTracker: assign sequential stack offsets to alloca instructions,
-// using the actual type size from DataLayout.
-struct AllocaTracker {
-  const DataLayout &DL;
-  unsigned NextOffset = 0;
-  DenseMap<AllocaInst *, unsigned> Offsets;
-
-  AllocaTracker(const DataLayout &DL) : DL(DL) {}
-
-  unsigned getOrCreate(AllocaInst *AI) {
-    auto It = Offsets.find(AI);
-    if (It != Offsets.end())
-      return It->second;
-    unsigned Off = NextOffset;
-    Offsets[AI] = Off;
-    NextOffset += DL.getTypeAllocSize(AI->getAllocatedType());
-    return Off;
-  }
-};
-
 // RegisterAllocator: assign virtual register numbers to SSA values.
 // Function arguments get r0, r1, ... r7 (up to 8).  All other values get
 // registers starting at r8.
@@ -152,7 +118,7 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
   // --- Phase 1: register allocation ---
   RegisterAllocator Regs;
 
-  AllocaTracker Allocas(F->getParent()->getDataLayout());
+  const DataLayout &DL = F->getParent()->getDataLayout();
   for (auto &I : instructions(F)) {
     if (!I.getType()->isVoidTy() && !isa<AllocaInst>(&I))
       Regs.get(&I);
@@ -173,9 +139,9 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
   for (auto &BB : *F) {
     for (auto &I : BB) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        unsigned Off = Allocas.getOrCreate(AI);
         unsigned RDst = Regs.get(AI);
-        emitInsn(BC, VM_LI, RDst, 0, Off);
+        uint64_t AllocSize = DL.getTypeAllocSize(AI->getAllocatedType());
+        emitInsn(BC, VM_ALLOCA, RDst, 0, static_cast<uint16_t>(AllocSize));
       } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
         Value *ValOp = SI->getValueOperand();
         Value *PtrOp = SI->getPointerOperand();
@@ -278,7 +244,7 @@ static void insertVmpcall(Function *F) {
   // Size as i32
   Constant *Size = ConstantInt::get(Int32Ty, BC.size());
 
-  Type *Int8PtrTy = PointerType::get(Int8Ty, 0);
+  Type *Int8PtrTy = PointerType::get(Ctx, 0);
 
   // Declare: void VMExecute(ptr, i32)
   FunctionType *ExecFnTy = FunctionType::get(

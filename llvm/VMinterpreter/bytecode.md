@@ -27,7 +27,7 @@
 
 | Opcode | Mnemonic | Format                  | Description                          |
 |--------|----------|-------------------------|--------------------------------------|
-| 0x00   | ALLOCA   | `ALLOCA rdst, #offset`  | 在 VM 栈上分配 4 字节，offset 为栈偏移 |
+| 0x00   | ALLOCA   | `ALLOCA rdst, #size`    | 在 VM 栈上分配 `size` 字节，返回栈顶地址 |
 | 0x01   | LOAD     | `LOAD rdst, raddr`      | 从 `raddr` 指向的地址加载 4 字节      |
 | 0x02   | STORE    | `STORE rval, raddr`     | 将 `rval` 的值存入 `raddr` 指向的地址 |
 | 0x03   | LI       | `LI rdst, #imm`         | 加载立即数到目标寄存器                |
@@ -40,9 +40,12 @@
 ### Instruction Details
 
 **ALLOCA** (0x00)
-- 编码: `[0x00][flags(0)][dst(2)][0][offset(2)]`
-- 为变量在 VM 栈上分配 4 字节，栈偏移记录在 `offset` 中
-- dst 持有该栈地址的别名（供后续 LOAD/STORE 使用）
+- 编码: `[0x00][flags(1)][dst(2)][src1(2)][src2(2)]`
+- VM 内部维护栈指针（从 0 向上增长），每次 ALLOCA 把当前栈顶地址赋给 `rdst`，栈指针增加分配大小
+- **flags bit 0 == 0**: `ALLOCA rdst, #imm` — src2 为立即数大小（编译时已知）
+  - 例如：`ALLOCA r8, #256` → r8 = 当前栈顶, 栈指针 += 256
+- **flags bit 0 == 1**: `ALLOCA rdst, rsize` — src1 为存放大小的寄存器（运行时 VLA）
+  - 例如：`ALLOCA r8, r1` → r8 = 当前栈顶, 栈指针 += r[1]
 
 **LOAD** (0x01)
 - 编码: `[0x01][flags(0)][dst(2)][raddr(2)][0]`
@@ -65,7 +68,7 @@
 
 | LLVM IR         | VM Bytecode   |
 |-----------------|---------------|
-| `alloca i32`    | `LI rdst, #offset` |
+| `alloca i32`    | `ALLOCA rdst, #size` |
 | `load ptr`      | `LOAD rdst, raddr` |
 | `store val, ptr`| `STORE rval, raddr`|
 | `add`           | `ADD rdst, rsrc1, rsrc2` |
@@ -103,11 +106,11 @@ int test(int a, int b) {
 
 生成的 bytecode：
 ```
-  0x0000: LI     r8, #0        ; alloca x at offset 0
-  0x0008: LI     r9, #4        ; alloca y at offset 4
-  0x0010: LI     r10, #8       ; alloca s at offset 8
-  0x0018: LI     r11, #12      ; alloca p at offset 12
-  0x0020: LI     r12, #16      ; alloca q at offset 16
+  0x0000: ALLOCA r8, #4        ; x = alloca i32
+  0x0008: ALLOCA r9, #4        ; y = alloca i32
+  0x0010: ALLOCA r10, #4       ; s = alloca i32
+  0x0018: ALLOCA r11, #4       ; p = alloca i32
+  0x0020: ALLOCA r12, #4       ; q = alloca i32
   0x0028: STORE  r0, r8        ; x = a (r0)
   0x0030: STORE  r1, r9        ; y = b (r1)
   0x0038: LOAD   r13, r8       ; load x
