@@ -74,13 +74,13 @@ static bool hasVMPAnnotation(Function *F, Module &M) {
 
 // Encode one instruction: [op(1) flags(1) dst(2) src1(2) src2(2)] = 8 bytes
 static void emitInsn(std::vector<uint8_t> &BC, uint8_t Op, uint16_t Dst,
-                     uint16_t Src1, uint16_t Src2) {
+                     uint16_t Src1, uint16_t Src2, uint8_t Flags = 0) {
   auto put16 = [&](uint16_t V) {
     BC.push_back(V & 0xFF);
     BC.push_back((V >> 8) & 0xFF);
   };
   BC.push_back(Op);
-  BC.push_back(0); // flags
+  BC.push_back(Flags);
   put16(Dst);
   put16(Src1);
   put16(Src2);
@@ -146,24 +146,26 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
         Value *ValOp = SI->getValueOperand();
         Value *PtrOp = SI->getPointerOperand();
         unsigned RVal = Regs.Map[ValOp];
+        uint8_t SFlags = (DL.getTypeStoreSize(ValOp->getType()) > 4) ? 1 : 0;
 
         if (auto *AI = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
           unsigned RAddr = Regs.get(AI);
-          emitInsn(BC, VM_STORE, RAddr, RVal, 0);
+          emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
         } else {
           unsigned RAddr = Regs.Map.lookup(PtrOp);
-          emitInsn(BC, VM_STORE, RAddr, RVal, 0);
+          emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
         }
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
         Value *PtrOp = LI->getPointerOperand();
         unsigned RDst = Regs.Map[&I];
+        uint8_t LFlags = (DL.getTypeStoreSize(LI->getType()) > 4) ? 1 : 0;
 
         if (auto *AI = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
           unsigned RAddr = Regs.get(AI);
-          emitInsn(BC, VM_LOAD, RDst, RAddr, 0);
+          emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
         } else {
           unsigned RAddr = Regs.Map.lookup(PtrOp);
-          emitInsn(BC, VM_LOAD, RDst, RAddr, 0);
+          emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
         }
       } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
         unsigned RDst = Regs.Map[&I];
@@ -246,9 +248,9 @@ static void insertVmpcall(Function *F) {
 
   Type *Int8PtrTy = PointerType::get(Ctx, 0);
 
-  // Declare: void VMExecute(ptr, i32)
+  // Declare: void *VMExecute(ptr, i32)
   FunctionType *ExecFnTy = FunctionType::get(
-      Type::getVoidTy(Ctx), {Int8PtrTy, Int32Ty}, false);
+      Int8PtrTy, {Int8PtrTy, Int32Ty}, false);
   FunctionCallee VmExec = M->getOrInsertFunction("VMExecute", ExecFnTy);
 
   // Declare: void VMSaveReg(ptr, ptr, ..., ptr)  — 8 register values
@@ -257,8 +259,22 @@ static void insertVmpcall(Function *F) {
       Type::getVoidTy(Ctx), EightPtrs, false);
   FunctionCallee VmSave = M->getOrInsertFunction("VMSaveReg", SaveFnTy);
 
-  // --- Insert calls at function entry ---
-  IRBuilder<> B(&F->getEntryBlock(), F->getEntryBlock().getFirstInsertionPt());
+  // --- Replace function body with VMSaveReg + VMExecute + return ---
+
+  // Get return type and pointer-sized integer type for casting
+  Type *RetTy = F->getReturnType();
+  const DataLayout &DL = M->getDataLayout();
+  Type *IntPtrTy = DL.getIntPtrType(Ctx);
+
+  // Remove all existing basic blocks
+  for (auto &BB : make_early_inc_range(*F)) {
+    BB.dropAllReferences();
+    BB.eraseFromParent();
+  }
+
+  // Create new entry block
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", F);
+  IRBuilder<> B(Entry);
 
   // 1) VMSaveReg(arg0..arg7) — capture actual argument values as VM registers
   unsigned ArgIdx = 0;
@@ -275,14 +291,29 @@ static void insertVmpcall(Function *F) {
       CastArg = Constant::getNullValue(Int8PtrTy);
     RegArgs[ArgIdx++] = CastArg;
   }
-  // Pad remaining register slots with null
   while (ArgIdx < 8)
     RegArgs[ArgIdx++] = Constant::getNullValue(Int8PtrTy);
 
   B.CreateCall(VmSave, RegArgs);
 
   // 2) VMExecute(bytecode_ptr, size)
-  B.CreateCall(VmExec, {BCPtr, Size});
+  CallInst *Result = B.CreateCall(VmExec, {BCPtr, Size});
+
+  // 3) Cast and return
+  if (RetTy->isVoidTy()) {
+    B.CreateRetVoid();
+  } else if (RetTy->isPointerTy()) {
+    B.CreateRet(B.CreateBitCast(Result, RetTy));
+  } else if (RetTy->isIntegerTy()) {
+    Value *V = B.CreatePtrToInt(Result, IntPtrTy);
+    if (IntPtrTy != RetTy)
+      V = B.CreateTrunc(V, RetTy);
+    B.CreateRet(V);
+  } else {
+    // For other types (float, etc.), go through intptr_t then bitcast
+    Value *V = B.CreatePtrToInt(Result, IntPtrTy);
+    B.CreateRet(B.CreateBitCast(V, RetTy));
+  }
 }
 
 //===----------------------------------------------------------------------===//
