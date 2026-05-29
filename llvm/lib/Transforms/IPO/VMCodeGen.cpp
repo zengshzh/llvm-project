@@ -153,7 +153,7 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
           emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
         } else {
           unsigned RAddr = Regs.Map.lookup(PtrOp);
-          emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
+          emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags | 2);
         }
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
         Value *PtrOp = LI->getPointerOperand();
@@ -165,7 +165,7 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
           emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
         } else {
           unsigned RAddr = Regs.Map.lookup(PtrOp);
-          emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
+          emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags | 2);
         }
       } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
         unsigned RDst = Regs.Map[&I];

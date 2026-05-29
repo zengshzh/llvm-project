@@ -11,24 +11,35 @@
 | Offset | Size | Field  | Description            |
 |--------|------|--------|------------------------|
 | 0      | 1    | opcode | 指令操作码              |
-| 1      | 1    | flags  | 标志位（保留，当前为 0） |
+| 1      | 1    | flags  | 标志位（见 Flags 定义） |
 | 2-3    | 2    | dst    | 目标寄存器编号           |
 | 4-5    | 2    | src1   | 源操作数 1              |
 | 6-7    | 2    | src2   | 源操作数 2 / 立即数      |
+
+## Flags
+
+| Bit | 用途     | 说明                                       |
+|-----|----------|-------------------------------------------|
+| 0   | 访问宽度 | 0 = 4 字节，1 = `sizeof(uintptr_t)` 字节  |
+| 1   | 内存空间 | 0 = VM 内部内存，1 = 原生内存（外部指针） |
+| 2-7 | 保留     | 当前为 0                                  |
+
+LOAD 和 STORE 使用 bit 0 + bit 1，ALLOCA 使用 bit 0 区分立即数/寄存器大小，其余指令 flags 当前为 0。
 
 ## Register Model
 
 - **r0 – r7**: 函数参数寄存器，由 `VMSaveReg` 在函数入口捕获
 - **r8+**: 通用虚拟寄存器，由 bytecode 生成器分配
 
-> 当前寄存器值 32 位，编码字段 16 位（支持 0–65535）。
+> 寄存器值宽度为 `uintptr_t`（32 位平台 4 字节，64 位平台 8 字节）。
+> 编码字段 16 位（支持 0–65535）。
 
 ## Opcode Table
 
 | Opcode | Mnemonic | Format                  | Description                          |
 |--------|----------|-------------------------|--------------------------------------|
 | 0x00   | ALLOCA   | `ALLOCA rdst, #size`    | 在 VM 栈上分配 `size` 字节，返回栈顶地址 |
-| 0x01   | LOAD     | `LOAD rdst, raddr`      | 从 `raddr` 指向的地址加载 4 字节      |
+| 0x01   | LOAD     | `LOAD rdst, raddr`      | 从 `raddr` 指向的地址加载 4/8 字节      |
 | 0x02   | STORE    | `STORE rval, raddr`     | 将 `rval` 的值存入 `raddr` 指向的地址 |
 | 0x03   | LI       | `LI rdst, #imm`         | 加载立即数到目标寄存器                |
 | 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2                 |
@@ -48,13 +59,17 @@
   - 例如：`ALLOCA r8, r1` → r8 = 当前栈顶, 栈指针 += r[1]
 
 **LOAD** (0x01)
-- 编码: `[0x01][flags(0)][dst(2)][raddr(2)][0]`
-- 从 `raddr` 指向的 VM 栈地址读取 4 字节，存入 `rdst`
+- 编码: `[0x01][flags(1)][dst(2)][raddr(2)][0]`
+- 从 `raddr` 指向的地址读取数据，存入 `rdst`
+- **flags bit 0**: 0 = 读取 4 字节，1 = 读取 `sizeof(uintptr_t)` 字节
+- **flags bit 1**: 0 = 从 VM 内部内存读取（`raddr` 为 ALLOCA 偏移量），1 = 从原生内存读取（`raddr` 为外部指针）
 
 **STORE** (0x02)
-- 编码: `[0x02][flags(0)][raddr(2)][rval(2)][0]`
-- 将 `rval` 的值写入 `raddr` 指向的 VM 栈地址
+- 编码: `[0x02][flags(1)][raddr(2)][rval(2)][0]`
+- 将 `rval` 的值写入 `raddr` 指向的地址
 - 注意: dst 字段在此指令中表示地址，src1 表示值
+- **flags bit 0**: 0 = 写入 4 字节，1 = 写入 `sizeof(uintptr_t)` 字节
+- **flags bit 1**: 0 = 写入 VM 内部内存，1 = 写入原生内存
 
 **LI** (0x03)
 - 编码: `[0x03][flags(0)][dst(2)][0][immediate(2)]`
@@ -69,8 +84,9 @@
 | LLVM IR         | VM Bytecode   |
 |-----------------|---------------|
 | `alloca i32`    | `ALLOCA rdst, #size` |
-| `load ptr`      | `LOAD rdst, raddr` |
-| `store val, ptr`| `STORE rval, raddr`|
+| `load i32, ptr` | `LOAD rdst, raddr` |
+| `load ptr, ptr` | `LOAD.nat rdst, raddr` (flags bit 1 = 1) |
+| `store val, ptr`| `STORE rval, raddr` |
 | `add`           | `ADD rdst, rsrc1, rsrc2` |
 | `sub`           | `SUB rdst, rsrc1, rsrc2` |
 | `mul`           | `MUL rdst, rsrc1, rsrc2` |
@@ -83,11 +99,11 @@
 
 ```
 VMSaveReg(r0, r1, ..., r7);     // 捕获 8 个函数参数作为 VM 寄存器初始值
-vmexecute(bytecode, size);       // 执行 bytecode
+VMExecute(bytecode, size);      // 执行 bytecode，返回 void*
 ```
 
 - `VMSaveReg` 将函数参数的运行时值存入 VM 寄存器供 bytecode 使用
-- `vmexecute` 开始解释执行 bytecode
+- `VMExecute` 开始解释执行 bytecode，返回值通过 `(rettype)VMExecute(...)` 转换
 
 ## Example
 
@@ -126,4 +142,27 @@ int test(int a, int b) {
   0x0088: STORE  r20, r12      ; save q
   0x0090: LOAD   r21, r12      ; load q
   0x0098: RET    r21
+```
+
+引用参数示例（`LOAD.nat` / `STORE.nat` 访问外部内存）：
+```c
+__attribute__((annotate("VMP")))
+void test(uint32_t &a, uint32_t &b) {
+    int c = (a + b) * a / b;
+    a = c;
+}
+```
+
+生成的 bytecode：
+```
+  0x0000: ALLOCA r37, #8       ; alloca ptr (reference a)
+  0x0008: ALLOCA r38, #8       ; alloca ptr (reference b)
+  0x0010: ALLOCA r39, #4       ; c = alloca i32
+  0x0018: STORE  r0, r37       ; store reference ptr a to alloca
+  0x0020: STORE  r1, r38       ; store reference ptr b to alloca
+  0x0028: LOAD.nat r8, r37     ; load a value via native ptr → r8 = *a
+  0x0030: LOAD.nat r9, r38     ; load b value via native ptr → r9 = *b
+  0x0038: ADD    r10, r8, r9   ; c = a + b
+  ...
+  0x0050: STORE.nat r10, r37   ; *a = c (write back via native ptr)
 ```

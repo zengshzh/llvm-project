@@ -33,35 +33,14 @@ typedef struct {
     uint32_t  vm_sp;
 } VMContext;
 
-// ---- debug print (hex + disassemble) ----
-static void disassemble(const uint8_t *bc, uint32_t size) {
-    printf("[disassemble]\n");
-    for (uint32_t off = 0; off + 8 <= size; off += 8)
-        print_insn(bc, off);
-}
-
-static void hexdump(const uint8_t *bc, uint32_t size) {
-    printf("[hexdump]\n");
-    for (uint32_t off = 0; off + 8 <= size; off += 8)
-        printf("  0x%04X: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
-               off, bc[off], bc[off+1], bc[off+2], bc[off+3],
-               bc[off+4], bc[off+5], bc[off+6], bc[off+7]);
-}
-
-void VMPrintBytecode(const uint8_t *bc, uint32_t size) {
-    printf("=== VM bytecode (%u bytes) ===\n", size);
-    hexdump(bc, size);
-    disassemble(bc, size);
-    printf("===========================\n");
-}
-
-// ---- execution engine ----
+// ---- instruction printer ----
 static void print_insn(const uint8_t *bc, uint32_t off) {
     uint8_t  op   = bc[off];
     uint8_t  flg  = bc[off + 1];
     uint16_t dst  = bc[off + 2] | (uint16_t)bc[off + 3] << 8;
     uint16_t src1 = bc[off + 4] | (uint16_t)bc[off + 5] << 8;
     uint16_t src2 = bc[off + 6] | (uint16_t)bc[off + 7] << 8;
+    const char *nat = (flg & 2) ? ".nat" : "";
 
     switch (op) {
     case VM_ALLOCA:
@@ -70,8 +49,8 @@ static void print_insn(const uint8_t *bc, uint32_t off) {
         else
             printf("  0x%04X: ALLOCA r%u, #%u\n",      off, dst, src2);
         break;
-    case VM_LOAD:  printf("  0x%04X: LOAD   r%u, r%u\n",      off, dst, src1); break;
-    case VM_STORE: printf("  0x%04X: STORE  r%u, r%u\n",      off, src1, dst); break;
+    case VM_LOAD:  printf("  0x%04X: LOAD%s r%u, r%u\n",      off, nat, dst, src1); break;
+    case VM_STORE: printf("  0x%04X: STORE%s r%u, r%u\n",      off, nat, src1, dst); break;
     case VM_LI:    printf("  0x%04X: LI     r%u, #%u\n",      off, dst, src2); break;
     case VM_ADD:   printf("  0x%04X: ADD    r%u, r%u, r%u\n", off, dst, src1, src2); break;
     case VM_SUB:   printf("  0x%04X: SUB    r%u, r%u, r%u\n", off, dst, src1, src2); break;
@@ -82,7 +61,24 @@ static void print_insn(const uint8_t *bc, uint32_t off) {
     }
 }
 
+// ---- debug print (hex + disassemble) ----
+// static void disassemble(const uint8_t *bc, uint32_t size) {
+//     printf("[disassemble]\n");
+//     for (uint32_t off = 0; off + 8 <= size; off += 8)
+//         print_insn(bc, off);
+// }
+
+static void hexdump(const uint8_t *bc, uint32_t size) {
+    printf("[hexdump]\n");
+    for (uint32_t off = 0; off + 8 <= size; off += 8)
+        printf("  0x%04X: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
+               off, bc[off], bc[off+1], bc[off+2], bc[off+3],
+               bc[off+4], bc[off+5], bc[off+6], bc[off+7]);
+}
+
+// ---- execution engine ----
 void *VMExecute(const uint8_t *bc, uint32_t size) {
+    hexdump(bc, size);
     printf("=== VM bytecode (%u bytes) ===\n", size);
 
     VMContext ctx;
@@ -128,29 +124,28 @@ void *VMExecute(const uint8_t *bc, uint32_t size) {
             break;
         }
         case VM_LOAD: {
-            uintptr_t load_addr = ctx.r[src1];
             size_t load_size = (flg & 1) ? sizeof(uintptr_t) : 4;
-            if (load_addr < ctx.mcap && load_addr + load_size <= ctx.mcap) {
-                memcpy(&ctx.r[dst], ctx.m + load_addr, load_size);
-            } else if (load_addr > 0) {
+            if (flg & 2) {
+                uintptr_t load_addr = ctx.r[src1];
+                if (!load_addr) { fprintf(stderr, "[VM] load null at 0x%04X\n", pc); goto cleanup; }
                 memcpy(&ctx.r[dst], (void *)load_addr, load_size);
             } else {
-                fprintf(stderr, "[VM] load bounds at 0x%04X\n", pc);
-                goto cleanup;
+                uintptr_t load_addr = ctx.r[src1];
+                if (load_addr + load_size > ctx.mcap) { fprintf(stderr, "[VM] load bounds at 0x%04X\n", pc); goto cleanup; }
+                memcpy(&ctx.r[dst], ctx.m + load_addr, load_size);
             }
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
         }
         case VM_STORE: {
-            uintptr_t store_addr = ctx.r[dst];
             size_t store_size = (flg & 1) ? sizeof(uintptr_t) : 4;
-            if (store_addr < ctx.mcap && store_addr + store_size <= ctx.mcap) {
-                memcpy(ctx.m + store_addr, &ctx.r[src1], store_size);
-            } else if (store_addr > 0) {
+            uintptr_t store_addr = ctx.r[dst];
+            if (flg & 2) {
+                if (!store_addr) { fprintf(stderr, "[VM] store null at 0x%04X\n", pc); goto cleanup; }
                 memcpy((void *)store_addr, &ctx.r[src1], store_size);
             } else {
-                fprintf(stderr, "[VM] store bounds at 0x%04X\n", pc);
-                goto cleanup;
+                if (store_addr + store_size > ctx.mcap) { fprintf(stderr, "[VM] store bounds at 0x%04X\n", pc); goto cleanup; }
+                memcpy(ctx.m + store_addr, &ctx.r[src1], store_size);
             }
             printf("  => mem[%u] = %u (0x%X)\n",
                    (uint32_t)store_addr, (uint32_t)ctx.r[src1], (uint32_t)ctx.r[src1]);
