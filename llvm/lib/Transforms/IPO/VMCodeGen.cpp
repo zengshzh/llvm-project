@@ -90,41 +90,94 @@ static void emitInsn(std::vector<uint8_t> &BC, uint8_t Op, uint16_t Dst,
 // Translate IR function to VM bytecode
 //===----------------------------------------------------------------------===//
 
-// RegisterAllocator: assign virtual register numbers to SSA values.
-// Function arguments get r0, r1, ... r7 (up to 8).  All other values get
-// registers starting at r8.
+// RegisterAllocator: dynamic register management with use-count recycling.
+// r0-r7 reserved for function args.  All other registers allocated via
+// free-list and automatically recycled when use count drops to zero.
 struct RegisterAllocator {
   unsigned NextReg = 8; // r0-r7 reserved for function args
+  unsigned MaxReg = 8;  // at least 8 for r0-r7
   DenseMap<Value *, unsigned> Map;
+  SmallVector<unsigned> FreeList;
+  DenseMap<Value *, unsigned> *UseCount;   // not owned
+  DenseMap<Value *, Value *> AliasParent;  // GEP alias → base
 
-  unsigned get(Value *V, bool ForceNew = false) {
-    if (!ForceNew) {
-      auto It = Map.find(V);
-      if (It != Map.end())
-        return It->second;
+  // Allocate a register and map it to value V (needed for lookups)
+  unsigned alloc(Value *V) {
+    unsigned r = allocRaw();
+    Map[V] = r;
+    return r;
+  }
+
+  // Allocate a temporary register (no Map entry, freed manually)
+  unsigned allocRaw() {
+    unsigned r;
+    if (!FreeList.empty()) {
+      r = FreeList.pop_back_val();
+    } else {
+      r = NextReg++;
     }
-    unsigned R = NextReg++;
-    Map[V] = R;
-    return R;
+    if (r + 1 > MaxReg)
+      MaxReg = r + 1;
+    return r;
+  }
+
+  void freeReg(unsigned r) {
+    FreeList.push_back(r);
+  }
+
+  // Consume an operand: decrement use count, auto-free when done
+  unsigned consume(Value *V) {
+    unsigned r = Map.lookup(V);
+    Value *realV = V;
+    while (AliasParent.count(realV))
+      realV = AliasParent[realV];
+    if (UseCount) {
+      auto It = UseCount->find(realV);
+      if (It != UseCount->end() && --It->second == 0)
+        freeReg(r);
+    }
+    return r;
+  }
+
+  // Look up an already-allocated register (no consume)
+  unsigned lookupReg(Value *V) {
+    return Map.lookup(V);
   }
 
   void setArg(unsigned ArgIdx, Value *V) {
     assert(ArgIdx < 8 && "Only 8 argument registers supported");
     Map[V] = ArgIdx;
   }
+
+  // Alias a GEP result to its base pointer (zero offset)
+  void aliasValue(Value *Alias, Value *Target) {
+    if (UseCount) {
+      (*UseCount)[Target] += (*UseCount)[Alias];
+      UseCount->erase(Alias);
+    }
+    AliasParent[Alias] = Target;
+    Map[Alias] = Map[Target];
+  }
 };
 
-static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
-  // --- Phase 1: register allocation ---
-  RegisterAllocator Regs;
-
-  const DataLayout &DL = F->getParent()->getDataLayout();
-  for (auto &I : instructions(F)) {
-    if (!I.getType()->isVoidTy() && !isa<AllocaInst>(&I))
-      Regs.get(&I);
+static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
+  // --- Phase 0: count operand uses for liveness ---
+  DenseMap<Value *, unsigned> UseCount;
+  for (auto &BB : *F) {
+    for (auto &I : BB) {
+      for (auto &Op : I.operands()) {
+        if (auto *OpI = dyn_cast<Instruction>(Op)) {
+          if (!OpI->getType()->isVoidTy() && !isa<AllocaInst>(OpI))
+            UseCount[OpI]++;
+        }
+      }
+    }
   }
 
-  // Map function arguments to r0..r7.
+  // --- Phase 1: register allocation (function args only) ---
+  RegisterAllocator Regs;
+  Regs.UseCount = &UseCount;
+
   {
     unsigned ArgIdx = 0;
     for (auto &Arg : F->args()) {
@@ -136,10 +189,11 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
   }
 
   // --- Phase 2: translate to bytecode ---
+  const DataLayout &DL = F->getParent()->getDataLayout();
   for (auto &BB : *F) {
     for (auto &I : BB) {
       if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-        unsigned RDst = Regs.get(AI);
+        unsigned RDst = Regs.alloc(AI);
         uint64_t AllocSize = DL.getTypeAllocSize(AI->getAllocatedType());
         emitInsn(BC, VM_ALLOCA, RDst, 0, static_cast<uint16_t>(AllocSize));
       } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -148,59 +202,65 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
         // Resolve value: if ConstantInt, emit LI first
         unsigned RVal;
         if (auto *CI = dyn_cast<ConstantInt>(ValOp)) {
-          RVal = Regs.get(CI, true);
+          RVal = Regs.allocRaw();
           emitInsn(BC, VM_LI, RVal, 0, static_cast<uint16_t>(CI->getZExtValue()));
         } else {
-          RVal = Regs.Map[ValOp];
+          RVal = Regs.consume(ValOp);
         }
         uint8_t SFlags = (DL.getTypeStoreSize(ValOp->getType()) > 4) ? 1 : 0;
 
-        if (auto *AI = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
-          unsigned RAddr = Regs.get(AI);
+        if (auto *AllocaPtr = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
+          unsigned RAddr = Regs.lookupReg(AllocaPtr);
           emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
         } else {
-          unsigned RAddr = Regs.Map.lookup(PtrOp);
+          unsigned RAddr = Regs.consume(PtrOp);
           emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags | 2);
         }
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
         Value *PtrOp = LI->getPointerOperand();
-        unsigned RDst = Regs.Map[&I];
+        unsigned RDst = Regs.alloc(&I);
         uint8_t LFlags = (DL.getTypeStoreSize(LI->getType()) > 4) ? 1 : 0;
 
-        if (auto *AI = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
-          unsigned RAddr = Regs.get(AI);
+        if (auto *AllocaPtr = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
+          unsigned RAddr = Regs.lookupReg(AllocaPtr);
           emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
         } else {
-          unsigned RAddr = Regs.Map.lookup(PtrOp);
+          unsigned RAddr = Regs.consume(PtrOp);
           emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags | 2);
         }
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         // GEP: compute pointer = base + byte_offset
         Value *PtrOp = GEP->getPointerOperand();
-        unsigned RDst = Regs.Map[&I];
-        unsigned RBase = Regs.Map[PtrOp];
         APInt Offset(DL.getPointerSizeInBits(), 0);
+        // Pre-allocate new regs BEFORE consume() so they can't collide
+        unsigned RDst = Regs.alloc(&I);
+        unsigned RTmp = Regs.allocRaw();
+        unsigned RBase = Regs.consume(PtrOp);
         if (GEP->accumulateConstantOffset(DL, Offset)) {
           if (Offset == 0) {
             // Zero offset → alias to base register
-            Regs.Map[&I] = RBase;
+            Regs.aliasValue(&I, PtrOp);
+            Regs.freeReg(RDst);  // RDst not needed for alias
+            Regs.freeReg(RTmp);
           } else {
             // Non-zero offset: rdst = rbase + offset
-            emitInsn(BC, VM_LI, RDst, 0, static_cast<uint16_t>(Offset.getZExtValue()));
-            emitInsn(BC, VM_ADD, RDst, RBase, RDst);
+            emitInsn(BC, VM_LI, RTmp, 0, static_cast<uint16_t>(Offset.getZExtValue()));
+            emitInsn(BC, VM_ADD, RDst, RBase, RTmp);
+            Regs.freeReg(RTmp);
           }
         } else {
           LLVM_DEBUG(dbgs() << "[VMCodeGen] unsupported variable-offset GEP\n");
         }
       } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        unsigned RDst = Regs.Map[&I];
-        // Resolve src1: if ConstantInt, emit LI
+        // Resolve src1: if ConstantInt, emit LI then free after use
         unsigned RSrc1;
+        bool Src1IsConst = false;
         if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(0))) {
-          RSrc1 = Regs.get(CI, true);
+          RSrc1 = Regs.allocRaw();
+          Src1IsConst = true;
           emitInsn(BC, VM_LI, RSrc1, 0, static_cast<uint16_t>(CI->getZExtValue()));
         } else {
-          RSrc1 = Regs.Map[BO->getOperand(0)];
+          RSrc1 = Regs.consume(BO->getOperand(0));
         }
         // Resolve src2: if ConstantInt, encode as immediate (flag bit 2)
         uint8_t ArithFlags = 0;
@@ -209,8 +269,10 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
           RSrc2 = static_cast<unsigned>(CI->getZExtValue());
           ArithFlags |= VM_FLAG_IMM;
         } else {
-          RSrc2 = Regs.Map[BO->getOperand(1)];
+          RSrc2 = Regs.consume(BO->getOperand(1));
         }
+
+        unsigned RDst = Regs.alloc(&I);
 
         switch (BO->getOpcode()) {
         case Instruction::Add:
@@ -262,17 +324,17 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
           report_fatal_error(StringRef(Msg));
         }
         }
+        // Free LI-allocated constant source registers
+        if (Src1IsConst) Regs.freeReg(RSrc1);
       } else if (auto *RI = dyn_cast<ReturnInst>(&I)) {
         unsigned RVal = 0;
         if (RI->getReturnValue()) {
           Value *RetVal = RI->getReturnValue();
-          if (isa<ConstantInt>(RetVal)) {
-            unsigned RConst = Regs.get(RetVal, true);
-            uint64_t CV = cast<ConstantInt>(RetVal)->getZExtValue();
-            emitInsn(BC, VM_LI, RConst, 0, static_cast<uint16_t>(CV));
-            RVal = RConst;
+          if (auto *CI = dyn_cast<ConstantInt>(RetVal)) {
+            RVal = Regs.allocRaw();
+            emitInsn(BC, VM_LI, RVal, 0, static_cast<uint16_t>(CI->getZExtValue()));
           } else {
-            RVal = Regs.Map.lookup(RetVal);
+            RVal = Regs.consume(RetVal);
           }
         }
         emitInsn(BC, VM_RET, RVal, 0, 0);
@@ -283,6 +345,7 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
       }
     }
   }
+  return Regs.MaxReg;
 }
 
 //===----------------------------------------------------------------------===//
@@ -294,7 +357,7 @@ static void insertVmpcall(Function *F) {
 
   // Generate bytecode
   std::vector<uint8_t> BC;
-  genBytecode(F, BC);
+  unsigned MaxRegs = genBytecode(F, BC);
 
   if (BC.empty())
     return;
@@ -320,9 +383,9 @@ static void insertVmpcall(Function *F) {
 
   Type *Int8PtrTy = PointerType::get(Ctx, 0);
 
-  // Declare: void *VMExecute(ptr, i32)
+  // Declare: void *VMExecute(ptr, i32, i32)
   FunctionType *ExecFnTy = FunctionType::get(
-      Int8PtrTy, {Int8PtrTy, Int32Ty}, false);
+      Int8PtrTy, {Int8PtrTy, Int32Ty, Int32Ty}, false);
   FunctionCallee VmExec = M->getOrInsertFunction("VMExecute", ExecFnTy);
 
   // Declare: void VMSaveReg(ptr, ptr, ..., ptr)  — 8 register values
@@ -368,8 +431,9 @@ static void insertVmpcall(Function *F) {
 
   B.CreateCall(VmSave, RegArgs);
 
-  // 2) VMExecute(bytecode_ptr, size)
-  CallInst *Result = B.CreateCall(VmExec, {BCPtr, Size});
+  // 2) VMExecute(bytecode_ptr, size, nregs)
+  Constant *NRegs = ConstantInt::get(Int32Ty, MaxRegs);
+  CallInst *Result = B.CreateCall(VmExec, {BCPtr, Size, NRegs});
 
   // 3) Cast and return
   if (RetTy->isVoidTy()) {

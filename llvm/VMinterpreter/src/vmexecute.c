@@ -4,8 +4,6 @@
 #include <stdlib.h>
 #include "vminterpreter.h"
 
-#define VM_REGS 4096
-
 // Saved register values from VMSaveReg, consumed by VMExecute
 static uintptr_t gpr[8];
 
@@ -27,16 +25,17 @@ void VMSaveReg(void *r0, void *r1, void *r2, void *r3,
 
 // ---- VM execution context ----
 typedef struct {
-    uintptr_t r[VM_REGS];
-    uint8_t  *m;
-    size_t    mcap;
-    uint32_t  vm_sp;
+    uintptr_t *r;    // dynamically allocated, nregs elements
+    uint32_t   nregs;
+    uint8_t   *m;
+    size_t     mcap;
+    uint32_t   vm_sp;
 } VMContext;
 
 // ---- helper: resolve src2 (register or immediate) — returns 0 on success ----
 static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t pc, uintptr_t *val) {
     if (flg & VM_FLAG_IMM) { *val = src2; return 0; }
-    if (src2 >= VM_REGS) {
+    if (src2 >= ctx->nregs) {
         fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc);
         return -1;
     }
@@ -45,15 +44,17 @@ static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t p
 }
 
 // ---- execution engine ----
-void *VMExecute(const uint8_t *bc, uint32_t size) {
+void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
     hexdump(bc, size);
-    printf("=== VM bytecode (%u bytes) ===\n", size);
+    printf("=== VM bytecode (%u bytes, %u regs) ===\n", size, nregs);
 
     VMContext ctx;
     memset(&ctx, 0, sizeof(ctx));
+    ctx.nregs = nregs;
+    ctx.r = calloc(nregs, sizeof(uintptr_t));
 
     // Restore argument registers saved by VMSaveReg
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 8 && i < (int)nregs; i++)
         ctx.r[i] = gpr[i];
 
     void *retval = NULL;
@@ -67,7 +68,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size) {
 
         print_insn(bc, pc);
 
-        if (dst >= VM_REGS || src1 >= VM_REGS) {
+        if (dst >= ctx.nregs || src1 >= ctx.nregs) {
             fprintf(stderr, "[VM] reg bounds at 0x%04X\n", pc);
             goto cleanup;
         }
@@ -239,6 +240,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size) {
     }
     fprintf(stderr, "[VM] no RET found\n");
 cleanup:
+    free(ctx.r);
     free(ctx.m);
     return retval;
 }
