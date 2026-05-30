@@ -39,7 +39,7 @@ void print_insn(const uint8_t *bc, uint32_t off) {
 }
 
 void hexdump(const uint8_t *bc, uint32_t size) {
-    printf("[hexdump]\n");
+    printf("=== [hexdump] ===\n");
     for (uint32_t off = 0; off + 8 <= size; off += 8)
         printf("  0x%04X: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
                off, bc[off], bc[off+1], bc[off+2], bc[off+3],
