@@ -145,7 +145,14 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
       } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
         Value *ValOp = SI->getValueOperand();
         Value *PtrOp = SI->getPointerOperand();
-        unsigned RVal = Regs.Map[ValOp];
+        // Resolve value: if ConstantInt, emit LI first
+        unsigned RVal;
+        if (auto *CI = dyn_cast<ConstantInt>(ValOp)) {
+          RVal = Regs.get(CI, true);
+          emitInsn(BC, VM_LI, RVal, 0, static_cast<uint16_t>(CI->getZExtValue()));
+        } else {
+          RVal = Regs.Map[ValOp];
+        }
         uint8_t SFlags = (DL.getTypeStoreSize(ValOp->getType()) > 4) ? 1 : 0;
 
         if (auto *AI = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
@@ -167,32 +174,93 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
           unsigned RAddr = Regs.Map.lookup(PtrOp);
           emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags | 2);
         }
+      } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+        // GEP: compute pointer = base + byte_offset
+        Value *PtrOp = GEP->getPointerOperand();
+        unsigned RDst = Regs.Map[&I];
+        unsigned RBase = Regs.Map[PtrOp];
+        APInt Offset(DL.getPointerSizeInBits(), 0);
+        if (GEP->accumulateConstantOffset(DL, Offset)) {
+          if (Offset == 0) {
+            // Zero offset → alias to base register
+            Regs.Map[&I] = RBase;
+          } else {
+            // Non-zero offset: rdst = rbase + offset
+            emitInsn(BC, VM_LI, RDst, 0, static_cast<uint16_t>(Offset.getZExtValue()));
+            emitInsn(BC, VM_ADD, RDst, RBase, RDst);
+          }
+        } else {
+          LLVM_DEBUG(dbgs() << "[VMCodeGen] unsupported variable-offset GEP\n");
+        }
       } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
         unsigned RDst = Regs.Map[&I];
-        unsigned RSrc1 = Regs.Map[BO->getOperand(0)];
-        unsigned RSrc2 = Regs.Map[BO->getOperand(1)];
+        // Resolve src1: if ConstantInt, emit LI
+        unsigned RSrc1;
+        if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(0))) {
+          RSrc1 = Regs.get(CI, true);
+          emitInsn(BC, VM_LI, RSrc1, 0, static_cast<uint16_t>(CI->getZExtValue()));
+        } else {
+          RSrc1 = Regs.Map[BO->getOperand(0)];
+        }
+        // Resolve src2: if ConstantInt, encode as immediate (flag bit 2)
+        uint8_t ArithFlags = 0;
+        unsigned RSrc2;
+        if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+          RSrc2 = static_cast<unsigned>(CI->getZExtValue());
+          ArithFlags |= VM_FLAG_IMM;
+        } else {
+          RSrc2 = Regs.Map[BO->getOperand(1)];
+        }
 
         switch (BO->getOpcode()) {
         case Instruction::Add:
         case Instruction::FAdd:
-          emitInsn(BC, VM_ADD, RDst, RSrc1, RSrc2);
+          emitInsn(BC, VM_ADD, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::Sub:
         case Instruction::FSub:
-          emitInsn(BC, VM_SUB, RDst, RSrc1, RSrc2);
+          emitInsn(BC, VM_SUB, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::Mul:
         case Instruction::FMul:
-          emitInsn(BC, VM_MUL, RDst, RSrc1, RSrc2);
+          emitInsn(BC, VM_MUL, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::UDiv:
+          emitInsn(BC, VM_UDIV, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
         case Instruction::SDiv:
-          emitInsn(BC, VM_UDIV, RDst, RSrc1, RSrc2);
+          emitInsn(BC, VM_SDIV, RDst, RSrc1, RSrc2, ArithFlags);
           break;
-        default:
-          LLVM_DEBUG(dbgs() << "[VMCodeGen] unsupported binary op: "
-                            << BO->getOpcodeName() << "\n");
+        case Instruction::URem:
+          emitInsn(BC, VM_UREM, RDst, RSrc1, RSrc2, ArithFlags);
           break;
+        case Instruction::SRem:
+          emitInsn(BC, VM_SREM, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::Shl:
+          emitInsn(BC, VM_SHL, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::LShr:
+          emitInsn(BC, VM_LSHR, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::AShr:
+          emitInsn(BC, VM_ASHR, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::And:
+          emitInsn(BC, VM_AND, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::Or:
+          emitInsn(BC, VM_OR, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::Xor:
+          emitInsn(BC, VM_XOR, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        default: {
+          std::string Msg =
+              "[VMCodeGen] unsupported binary op: " +
+              std::string(BO->getOpcodeName()) + "\n";
+          report_fatal_error(StringRef(Msg));
+        }
         }
       } else if (auto *RI = dyn_cast<ReturnInst>(&I)) {
         unsigned RVal = 0;
@@ -208,6 +276,10 @@ static void genBytecode(Function *F, std::vector<uint8_t> &BC) {
           }
         }
         emitInsn(BC, VM_RET, RVal, 0, 0);
+      } else {
+        report_fatal_error(
+            Twine("[VMCodeGen] unsupported instruction: ") +
+            I.getOpcodeName() + "\n");
       }
     }
   }

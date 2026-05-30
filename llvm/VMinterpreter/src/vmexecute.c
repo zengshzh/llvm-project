@@ -33,47 +33,15 @@ typedef struct {
     uint32_t  vm_sp;
 } VMContext;
 
-// ---- instruction printer ----
-static void print_insn(const uint8_t *bc, uint32_t off) {
-    uint8_t  op   = bc[off];
-    uint8_t  flg  = bc[off + 1];
-    uint16_t dst  = bc[off + 2] | (uint16_t)bc[off + 3] << 8;
-    uint16_t src1 = bc[off + 4] | (uint16_t)bc[off + 5] << 8;
-    uint16_t src2 = bc[off + 6] | (uint16_t)bc[off + 7] << 8;
-    const char *nat = (flg & 2) ? ".nat" : "";
-
-    switch (op) {
-    case VM_ALLOCA:
-        if (flg & 1)
-            printf("  0x%04X: ALLOCA r%u, r%u\n",      off, dst, src1);
-        else
-            printf("  0x%04X: ALLOCA r%u, #%u\n",      off, dst, src2);
-        break;
-    case VM_LOAD:  printf("  0x%04X: LOAD%s r%u, r%u\n",      off, nat, dst, src1); break;
-    case VM_STORE: printf("  0x%04X: STORE%s r%u, r%u\n",      off, nat, src1, dst); break;
-    case VM_LI:    printf("  0x%04X: LI     r%u, #%u\n",      off, dst, src2); break;
-    case VM_ADD:   printf("  0x%04X: ADD    r%u, r%u, r%u\n", off, dst, src1, src2); break;
-    case VM_SUB:   printf("  0x%04X: SUB    r%u, r%u, r%u\n", off, dst, src1, src2); break;
-    case VM_MUL:   printf("  0x%04X: MUL    r%u, r%u, r%u\n", off, dst, src1, src2); break;
-    case VM_UDIV:  printf("  0x%04X: DIV    r%u, r%u, r%u\n", off, dst, src1, src2); break;
-    case VM_RET:   printf("  0x%04X: RET    r%u\n",           off, dst); break;
-    default:       printf("  0x%04X: ???    (op=%02X)\n",      off, op); break;
+// ---- helper: resolve src2 (register or immediate) — returns 0 on success ----
+static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t pc, uintptr_t *val) {
+    if (flg & VM_FLAG_IMM) { *val = src2; return 0; }
+    if (src2 >= VM_REGS) {
+        fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc);
+        return -1;
     }
-}
-
-// ---- debug print (hex + disassemble) ----
-// static void disassemble(const uint8_t *bc, uint32_t size) {
-//     printf("[disassemble]\n");
-//     for (uint32_t off = 0; off + 8 <= size; off += 8)
-//         print_insn(bc, off);
-// }
-
-static void hexdump(const uint8_t *bc, uint32_t size) {
-    printf("[hexdump]\n");
-    for (uint32_t off = 0; off + 8 <= size; off += 8)
-        printf("  0x%04X: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
-               off, bc[off], bc[off+1], bc[off+2], bc[off+3],
-               bc[off+4], bc[off+5], bc[off+6], bc[off+7]);
+    *val = ctx->r[src2];
+    return 0;
 }
 
 // ---- execution engine ----
@@ -128,11 +96,23 @@ void *VMExecute(const uint8_t *bc, uint32_t size) {
             if (flg & 2) {
                 uintptr_t load_addr = ctx.r[src1];
                 if (!load_addr) { fprintf(stderr, "[VM] load null at 0x%04X\n", pc); goto cleanup; }
-                memcpy(&ctx.r[dst], (void *)load_addr, load_size);
+                if (load_size == 4) {
+                    int32_t tmp;
+                    memcpy(&tmp, (void *)load_addr, 4);
+                    ctx.r[dst] = (intptr_t)tmp;  // sign-extend 32→64
+                } else {
+                    memcpy(&ctx.r[dst], (void *)load_addr, load_size);
+                }
             } else {
                 uintptr_t load_addr = ctx.r[src1];
                 if (load_addr + load_size > ctx.mcap) { fprintf(stderr, "[VM] load bounds at 0x%04X\n", pc); goto cleanup; }
-                memcpy(&ctx.r[dst], ctx.m + load_addr, load_size);
+                if (load_size == 4) {
+                    int32_t tmp;
+                    memcpy(&tmp, ctx.m + load_addr, 4);
+                    ctx.r[dst] = (intptr_t)tmp;  // sign-extend 32→64
+                } else {
+                    memcpy(&ctx.r[dst], ctx.m + load_addr, load_size);
+                }
             }
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
@@ -147,36 +127,107 @@ void *VMExecute(const uint8_t *bc, uint32_t size) {
                 if (store_addr + store_size > ctx.mcap) { fprintf(stderr, "[VM] store bounds at 0x%04X\n", pc); goto cleanup; }
                 memcpy(ctx.m + store_addr, &ctx.r[src1], store_size);
             }
-            printf("  => mem[%u] = %u (0x%X)\n",
-                   (uint32_t)store_addr, (uint32_t)ctx.r[src1], (uint32_t)ctx.r[src1]);
+            printf("  => mem[%zu] = %zu (0x%zX)\n",
+                   store_addr, ctx.r[src1], ctx.r[src1]);
             break;
         }
         case VM_LI:
             ctx.r[dst] = src2;
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
-        case VM_ADD:
-            if (src2 >= VM_REGS) { fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc); goto cleanup; }
-            ctx.r[dst] = (uint32_t)(ctx.r[src1] + ctx.r[src2]);
+        case VM_ADD: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] + _v2_;
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
-        case VM_SUB:
-            if (src2 >= VM_REGS) { fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc); goto cleanup; }
-            ctx.r[dst] = (uint32_t)(ctx.r[src1] - ctx.r[src2]);
+        }
+        case VM_SUB: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] - _v2_;
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
-        case VM_MUL:
-            if (src2 >= VM_REGS) { fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc); goto cleanup; }
-            ctx.r[dst] = (uint32_t)(ctx.r[src1] * ctx.r[src2]);
+        }
+        case VM_MUL: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] * _v2_;
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
-        case VM_UDIV:
-            if (src2 >= VM_REGS) { fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc); goto cleanup; }
-            ctx.r[dst] = ctx.r[src2] ? (uint32_t)(ctx.r[src1] / ctx.r[src2]) : 0;
+        }
+        case VM_UDIV: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = _v2_ ? (ctx.r[src1] / _v2_) : 0;
             mod_dst = dst; mod_val = ctx.r[dst];
             break;
+        }
+        case VM_SDIV: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = _v2_ ? (uintptr_t)((intptr_t)ctx.r[src1] / (intptr_t)_v2_) : 0;
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_UREM: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = _v2_ ? (ctx.r[src1] % _v2_) : 0;
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_SREM: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = _v2_ ? (uintptr_t)((intptr_t)ctx.r[src1] % (intptr_t)_v2_) : 0;
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_SHL: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] << (_v2_ & (sizeof(uintptr_t) * 8 - 1));
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_LSHR: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] >> (_v2_ & (sizeof(uintptr_t) * 8 - 1));
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_ASHR: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = (uintptr_t)((intptr_t)ctx.r[src1] >> (_v2_ & (sizeof(uintptr_t) * 8 - 1)));
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_AND: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] & _v2_;
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_OR: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] | _v2_;
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
+        case VM_XOR: {
+            uintptr_t _v2_;
+            if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup;
+            ctx.r[dst] = ctx.r[src1] ^ _v2_;
+            mod_dst = dst; mod_val = ctx.r[dst];
+            break;
+        }
         case VM_RET:
-            printf("[VM] return: %u (0x%08X)\n", (uint32_t)ctx.r[dst], (uint32_t)ctx.r[dst]);
+            printf("[VM] return: %zu (0x%zX)\n", ctx.r[dst], ctx.r[dst]);
             retval = (void *)(uintptr_t)ctx.r[dst];
             goto cleanup;
         default:
@@ -184,10 +235,9 @@ void *VMExecute(const uint8_t *bc, uint32_t size) {
             goto cleanup;
         }
         if (mod_dst != UINT32_MAX)
-            printf("  => r%u = %u (0x%X)\n", mod_dst, (uint32_t)mod_val, (uint32_t)mod_val);
+            printf("  => r%u = %zu (0x%zX)\n", mod_dst, mod_val, mod_val);
     }
     fprintf(stderr, "[VM] no RET found\n");
-
 cleanup:
     free(ctx.m);
     return retval;

@@ -22,9 +22,11 @@
 |-----|----------|-------------------------------------------|
 | 0   | 访问宽度 | 0 = 4 字节，1 = `sizeof(uintptr_t)` 字节  |
 | 1   | 内存空间 | 0 = VM 内部内存，1 = 原生内存（外部指针） |
-| 2-7 | 保留     | 当前为 0                                  |
+| 2   | 立即数   | 0 = src2 为寄存器，1 = src2 为 16 位立即数（算术/逻辑运算专用） |
+| 3-7 | 保留     | 当前为 0                                  |
 
-LOAD 和 STORE 使用 bit 0 + bit 1，ALLOCA 使用 bit 0 区分立即数/寄存器大小，其余指令 flags 当前为 0。
+LOAD 和 STORE 使用 bit 0 + bit 1，ALLOCA 使用 bit 0 区分立即数/寄存器大小。
+算术/逻辑运算（ADD–XOR）使用 **bit 2** 指示 src2 是 16 位立即数还是寄存器索引。
 
 ## Register Model
 
@@ -42,10 +44,19 @@ LOAD 和 STORE 使用 bit 0 + bit 1，ALLOCA 使用 bit 0 区分立即数/寄存
 | 0x01   | LOAD     | `LOAD rdst, raddr`      | 从 `raddr` 指向的地址加载 4/8 字节      |
 | 0x02   | STORE    | `STORE rval, raddr`     | 将 `rval` 的值存入 `raddr` 指向的地址 |
 | 0x03   | LI       | `LI rdst, #imm`         | 加载立即数到目标寄存器                |
-| 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2                 |
-| 0x11   | SUB      | `SUB rdst, rsrc1, rsrc2`| rdst = rsrc1 - rsrc2                 |
-| 0x12   | MUL      | `MUL rdst, rsrc1, rsrc2`| rdst = rsrc1 * rsrc2                 |
-| 0x13   | DIV      | `DIV rdst, rsrc1, rsrc2`| rdst = rsrc1 / rsrc2 (unsigned)      |
+| 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2 (整数/浮点加法)   |
+| 0x11   | SUB      | `SUB rdst, rsrc1, rsrc2`| rdst = rsrc1 - rsrc2 (整数/浮点减法)   |
+| 0x12   | MUL      | `MUL rdst, rsrc1, rsrc2`| rdst = rsrc1 * rsrc2 (整数/浮点乘法)   |
+| 0x13   | UDIV     | `UDIV rdst, rsrc1, rsrc2`| rdst = rsrc1 / rsrc2 (无符号整数除法) |
+| 0x14   | SDIV     | `SDIV rdst, rsrc1, rsrc2`| rdst = rsrc1 / rsrc2 (有符号整数除法) |
+| 0x15   | UREM     | `UREM rdst, rsrc1, rsrc2`| rdst = rsrc1 % rsrc2 (无符号取余)     |
+| 0x16   | SREM     | `SREM rdst, rsrc1, rsrc2`| rdst = rsrc1 % rsrc2 (有符号取余)     |
+| 0x17   | SHL      | `SHL rdst, rsrc1, rsrc2` | rdst = rsrc1 << rsrc2 (左移)          |
+| 0x18   | LSHR     | `LSHR rdst, rsrc1, rsrc2`| rdst = rsrc1 >> rsrc2 (逻辑右移)      |
+| 0x19   | ASHR     | `ASHR rdst, rsrc1, rsrc2`| rdst = rsrc1 >> rsrc2 (算术右移)      |
+| 0x1A   | AND      | `AND rdst, rsrc1, rsrc2` | rdst = rsrc1 & rsrc2 (按位与)         |
+| 0x1B   | OR       | `OR rdst, rsrc1, rsrc2`  | rdst = rsrc1 \| rsrc2 (按位或)        |
+| 0x1C   | XOR      | `XOR rdst, rsrc1, rsrc2` | rdst = rsrc1 ^ rsrc2 (按位异或)       |
 | 0x20   | RET      | `RET rval`              | 返回 `rval` 中的值                   |
 
 ### Instruction Details
@@ -90,7 +101,16 @@ LOAD 和 STORE 使用 bit 0 + bit 1，ALLOCA 使用 bit 0 区分立即数/寄存
 | `add`           | `ADD rdst, rsrc1, rsrc2` |
 | `sub`           | `SUB rdst, rsrc1, rsrc2` |
 | `mul`           | `MUL rdst, rsrc1, rsrc2` |
-| `udiv` / `sdiv` | `DIV rdst, rsrc1, rsrc2` |
+| `udiv`          | `UDIV rdst, rsrc1, rsrc2` |
+| `sdiv`          | `SDIV rdst, rsrc1, rsrc2` |
+| `urem`          | `UREM rdst, rsrc1, rsrc2` |
+| `srem`          | `SREM rdst, rsrc1, rsrc2` |
+| `shl`           | `SHL rdst, rsrc1, rsrc2` |
+| `lshr`          | `LSHR rdst, rsrc1, rsrc2` |
+| `ashr`          | `ASHR rdst, rsrc1, rsrc2` |
+| `and`           | `AND rdst, rsrc1, rsrc2` |
+| `or`            | `OR rdst, rsrc1, rsrc2` |
+| `xor`           | `XOR rdst, rsrc1, rsrc2` |
 | `ret val`       | `RET rval` |
 
 ## Runtime Interface
