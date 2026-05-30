@@ -38,13 +38,6 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     }
 }
 
-// ---- debug print (hex + disassemble) ----
-// static void disassemble(const uint8_t *bc, uint32_t size) {
-//     printf("[disassemble]\n");
-//     for (uint32_t off = 0; off + 8 <= size; off += 8)
-//         print_insn(bc, off);
-// }
-
 void hexdump(const uint8_t *bc, uint32_t size) {
     printf("[hexdump]\n");
     for (uint32_t off = 0; off + 8 <= size; off += 8)
