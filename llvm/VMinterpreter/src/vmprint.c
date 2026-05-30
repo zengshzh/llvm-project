@@ -20,6 +20,15 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     case VM_LOAD:  printf("  0x%04X: LOAD%s r%u, r%u  ",      off, nat, dst, src1); break;
     case VM_STORE: printf("  0x%04X: STORE%s r%u, r%u  ",      off, nat, src1, dst); break;
     case VM_LI:    printf("  0x%04X: LI     r%u, #%u  ",      off, dst, src2); break;
+    case VM_LI32:  printf("  0x%04X: LI32   r%u, #%u  ",      off, dst, (uint32_t)src1 | ((uint32_t)src2 << 16)); break;
+    case VM_SITOFP: printf("  0x%04X: SITOFP r%u, r%u  ",     off, dst, src1); break;
+    case VM_FPTOSI: printf("  0x%04X: FPTOSI r%u, r%u  ",     off, dst, src1); break;
+    case VM_FPTRUNC: printf("  0x%04X: FPTRUNC r%u, r%u  ",   off, dst, src1); break;
+    case VM_FPEXT:  printf("  0x%04X: FPEXT  r%u, r%u  ",     off, dst, src1); break;
+    case VM_FADD:  printf("  0x%04X: FADD   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
+    case VM_FSUB:  printf("  0x%04X: FSUB   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
+    case VM_FMUL:  printf("  0x%04X: FMUL   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
+    case VM_FDIV:  printf("  0x%04X: FDIV   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_ADD:   printf("  0x%04X: ADD    r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_SUB:   printf("  0x%04X: SUB    r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_MUL:   printf("  0x%04X: MUL    r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
@@ -44,4 +53,8 @@ void hexdump(const uint8_t *bc, uint32_t size) {
         printf("  0x%04X: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
                off, bc[off], bc[off+1], bc[off+2], bc[off+3],
                bc[off+4], bc[off+5], bc[off+6], bc[off+7]);
+}
+
+void print_reg_result(unsigned reg, uintptr_t val) {
+    printf("  => r%u = %zu (0x%zX)\n", reg, val, val);
 }

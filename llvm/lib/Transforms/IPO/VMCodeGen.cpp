@@ -86,6 +86,20 @@ static void emitInsn(std::vector<uint8_t> &BC, uint8_t Op, uint16_t Dst,
   put16(Src2);
 }
 
+// Encode LI32: [op(1) flags(1) dst(2) value_lo(2) value_hi(2)] = 8 bytes
+static void emitInsn32(std::vector<uint8_t> &BC, uint8_t Op, uint16_t Dst,
+                       uint32_t Val) {
+  auto put16 = [&](uint16_t V) {
+    BC.push_back(V & 0xFF);
+    BC.push_back((V >> 8) & 0xFF);
+  };
+  BC.push_back(Op);
+  BC.push_back(0);
+  put16(Dst);
+  put16(Val & 0xFFFF);
+  put16((Val >> 16) & 0xFFFF);
+}
+
 //===----------------------------------------------------------------------===//
 // Translate IR function to VM bytecode
 //===----------------------------------------------------------------------===//
@@ -199,15 +213,20 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
       } else if (auto *SI = dyn_cast<StoreInst>(&I)) {
         Value *ValOp = SI->getValueOperand();
         Value *PtrOp = SI->getPointerOperand();
-        // Resolve value: if ConstantInt, emit LI first
+        // Resolve value: handle constants (int → LI, float → LI32)
         unsigned RVal;
         if (auto *CI = dyn_cast<ConstantInt>(ValOp)) {
           RVal = Regs.allocRaw();
           emitInsn(BC, VM_LI, RVal, 0, static_cast<uint16_t>(CI->getZExtValue()));
+        } else if (auto *CF = dyn_cast<ConstantFP>(ValOp)) {
+          RVal = Regs.allocRaw();
+          uint32_t Bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
+          emitInsn32(BC, VM_LI32, RVal, Bits);
         } else {
           RVal = Regs.consume(ValOp);
         }
         uint8_t SFlags = (DL.getTypeStoreSize(ValOp->getType()) > 4) ? 1 : 0;
+        if (ValOp->getType()->isFloatTy()) SFlags |= VM_FLAG_FLOAT;
 
         if (auto *AllocaPtr = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
           unsigned RAddr = Regs.lookupReg(AllocaPtr);
@@ -220,6 +239,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
         Value *PtrOp = LI->getPointerOperand();
         unsigned RDst = Regs.alloc(&I);
         uint8_t LFlags = (DL.getTypeStoreSize(LI->getType()) > 4) ? 1 : 0;
+        if (LI->getType()->isFloatTy()) LFlags |= VM_FLAG_FLOAT;
 
         if (auto *AllocaPtr = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
           unsigned RAddr = Regs.lookupReg(AllocaPtr);
@@ -252,46 +272,68 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
           LLVM_DEBUG(dbgs() << "[VMCodeGen] unsupported variable-offset GEP\n");
         }
       } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-        // Resolve src1: if ConstantInt, emit LI then free after use
+        // Resolve src1: handle int/float constants
         unsigned RSrc1;
         bool Src1IsConst = false;
         if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(0))) {
           RSrc1 = Regs.allocRaw();
           Src1IsConst = true;
           emitInsn(BC, VM_LI, RSrc1, 0, static_cast<uint16_t>(CI->getZExtValue()));
+        } else if (auto *CF = dyn_cast<ConstantFP>(BO->getOperand(0))) {
+          RSrc1 = Regs.allocRaw();
+          Src1IsConst = true;
+          uint32_t Bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
+          emitInsn32(BC, VM_LI32, RSrc1, Bits);
         } else {
           RSrc1 = Regs.consume(BO->getOperand(0));
         }
-        // Resolve src2: if ConstantInt, encode as immediate (flag bit 2)
+        // Resolve src2: int constant → IMM, float constant → LI32
         uint8_t ArithFlags = 0;
         unsigned RSrc2;
+        bool Src2IsFP = false;
         if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1))) {
           RSrc2 = static_cast<unsigned>(CI->getZExtValue());
           ArithFlags |= VM_FLAG_IMM;
+        } else if (auto *CF = dyn_cast<ConstantFP>(BO->getOperand(1))) {
+          RSrc2 = Regs.allocRaw();
+          Src2IsFP = true;
+          uint32_t Bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
+          emitInsn32(BC, VM_LI32, RSrc2, Bits);
         } else {
           RSrc2 = Regs.consume(BO->getOperand(1));
         }
 
         unsigned RDst = Regs.alloc(&I);
+        // Float double-width: bit 0 = 1 for double-precision ops
+        if (I.getType()->isDoubleTy()) ArithFlags |= 1;
 
         switch (BO->getOpcode()) {
         case Instruction::Add:
-        case Instruction::FAdd:
           emitInsn(BC, VM_ADD, RDst, RSrc1, RSrc2, ArithFlags);
           break;
+        case Instruction::FAdd:
+          emitInsn(BC, VM_FADD, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
         case Instruction::Sub:
-        case Instruction::FSub:
           emitInsn(BC, VM_SUB, RDst, RSrc1, RSrc2, ArithFlags);
           break;
+        case Instruction::FSub:
+          emitInsn(BC, VM_FSUB, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
         case Instruction::Mul:
-        case Instruction::FMul:
           emitInsn(BC, VM_MUL, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::FMul:
+          emitInsn(BC, VM_FMUL, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::UDiv:
           emitInsn(BC, VM_UDIV, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::SDiv:
           emitInsn(BC, VM_SDIV, RDst, RSrc1, RSrc2, ArithFlags);
+          break;
+        case Instruction::FDiv:
+          emitInsn(BC, VM_FDIV, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::URem:
           emitInsn(BC, VM_UREM, RDst, RSrc1, RSrc2, ArithFlags);
@@ -326,6 +368,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
         }
         // Free LI-allocated constant source registers
         if (Src1IsConst) Regs.freeReg(RSrc1);
+        if (Src2IsFP) Regs.freeReg(RSrc2);
       } else if (auto *RI = dyn_cast<ReturnInst>(&I)) {
         unsigned RVal = 0;
         if (RI->getReturnValue()) {
@@ -333,11 +376,55 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
           if (auto *CI = dyn_cast<ConstantInt>(RetVal)) {
             RVal = Regs.allocRaw();
             emitInsn(BC, VM_LI, RVal, 0, static_cast<uint16_t>(CI->getZExtValue()));
+          } else if (auto *CF = dyn_cast<ConstantFP>(RetVal)) {
+            RVal = Regs.allocRaw();
+            uint32_t Bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
+            emitInsn32(BC, VM_LI32, RVal, Bits);
           } else {
             RVal = Regs.consume(RetVal);
           }
         }
         emitInsn(BC, VM_RET, RVal, 0, 0);
+      } else if (auto *CI = dyn_cast<CastInst>(&I)) {
+        unsigned RDst = Regs.alloc(&I);
+        // Resolve source operand (may be ConstantInt/ConstantFP)
+        unsigned RSrc;
+        bool SrcIsConst = false;
+        if (auto *CInt = dyn_cast<ConstantInt>(CI->getOperand(0))) {
+          RSrc = Regs.allocRaw();
+          SrcIsConst = true;
+          emitInsn(BC, VM_LI, RSrc, 0, static_cast<uint16_t>(CInt->getZExtValue()));
+        } else if (auto *CFP = dyn_cast<ConstantFP>(CI->getOperand(0))) {
+          RSrc = Regs.allocRaw();
+          SrcIsConst = true;
+          uint32_t Bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
+          emitInsn32(BC, VM_LI32, RSrc, Bits);
+        } else {
+          RSrc = Regs.consume(CI->getOperand(0));
+        }
+        switch (CI->getOpcode()) {
+        case Instruction::SIToFP: {
+          uint8_t CF = CI->getDestTy()->isDoubleTy() ? 1 : 0;
+          emitInsn(BC, VM_SITOFP, RDst, RSrc, 0, CF);
+          break;
+        }
+        case Instruction::FPToSI: {
+          uint8_t CF = CI->getSrcTy()->isDoubleTy() ? 1 : 0;
+          emitInsn(BC, VM_FPTOSI, RDst, RSrc, 0, CF);
+          break;
+        }
+        case Instruction::FPTrunc:
+          emitInsn(BC, VM_FPTRUNC, RDst, RSrc, 0);
+          break;
+        case Instruction::FPExt:
+          emitInsn(BC, VM_FPEXT, RDst, RSrc, 0);
+          break;
+        default:
+          report_fatal_error(
+              Twine("[VMCodeGen] unsupported cast: ") +
+              CI->getOpcodeName() + "\n");
+        }
+        if (SrcIsConst) Regs.freeReg(RSrc);
       } else {
         report_fatal_error(
             Twine("[VMCodeGen] unsupported instruction: ") +
