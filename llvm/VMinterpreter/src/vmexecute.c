@@ -59,7 +59,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
 
     void *retval = NULL;
 
-    for (uint32_t pc = 0; pc + 8 <= size; pc += 8) {
+    for (uint32_t pc = 0; pc + 8 <= size; ) {
         uint8_t  op   = bc[pc];
         uint8_t  flg  = bc[pc + 1];
         uint16_t dst  = bc[pc + 2] | (uint16_t)bc[pc + 3] << 8;
@@ -68,14 +68,17 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
 
         print_insn(bc, pc);
 
-        if (dst >= ctx.nregs || src1 >= ctx.nregs) {
-            fprintf(stderr, "[VM] reg bounds at 0x%04X\n", pc);
-            goto cleanup;
+        // JMP/BR use src1/src2 as offsets, not register indices
+        if (op != VM_JMP && op != VM_BR) {
+            if (dst >= ctx.nregs || src1 >= ctx.nregs) {
+                fprintf(stderr, "[VM] reg bounds at 0x%04X\n", pc);
+                goto cleanup;
+            }
         }
 
 // Integer binary op: resolves src2, evaluates expr, prints result
 #define INT_BINOP(expr) do { \
-    uintptr_t _v2_; \
+    uintptr_t _v2_ = 0; \
     if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup; \
     ctx.r[dst] = (expr); \
     print_reg_result(dst, ctx.r[dst]); \
@@ -83,7 +86,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
 
 // Float binary op: bit0=0 → 32-bit float, bit0=1 → 64-bit double
 #define FLOAT_BINOP(op) do { \
-    uintptr_t _v2_; \
+    uintptr_t _v2_ = 0; \
     if (vm_src2(&ctx, flg, src2, pc, &_v2_)) goto cleanup; \
     if (flg & 1) { \
         double da, db; \
@@ -219,6 +222,56 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
         case VM_AND:   { INT_BINOP(ctx.r[src1] & _v2_); break; }
         case VM_OR:    { INT_BINOP(ctx.r[src1] | _v2_); break; }
         case VM_XOR:   { INT_BINOP(ctx.r[src1] ^ _v2_); break; }
+        case VM_MOV:
+            ctx.r[dst] = ctx.r[src1];
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        case VM_CMP: {
+            if (src2 >= ctx.nregs) {
+                fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc);
+                goto cleanup;
+            }
+            uintptr_t a = ctx.r[src1], b = ctx.r[src2];
+            uint8_t pred = flg & 0x0F;
+            uintptr_t r = 0;
+            switch (pred) {
+            case 0:  r = (a == b) ? 1 : 0; break;                       // EQ
+            case 1:  r = (a != b) ? 1 : 0; break;                       // NE
+            case 2:  r = (a >  b) ? 1 : 0; break;                       // UGT
+            case 3:  r = (a >= b) ? 1 : 0; break;                       // UGE
+            case 4:  r = (a <  b) ? 1 : 0; break;                       // ULT
+            case 5:  r = (a <= b) ? 1 : 0; break;                       // ULE
+            case 6:  r = ((intptr_t)a >  (intptr_t)b) ? 1 : 0; break;  // SGT
+            case 7:  r = ((intptr_t)a >= (intptr_t)b) ? 1 : 0; break;  // SGE
+            case 8:  r = ((intptr_t)a <  (intptr_t)b) ? 1 : 0; break;  // SLT
+            case 9:  r = ((intptr_t)a <= (intptr_t)b) ? 1 : 0; break;  // SLE
+            default:
+                fprintf(stderr, "[VM] bad cmp pred %u at 0x%04X\n", pred, pc);
+                goto cleanup;
+            }
+            ctx.r[dst] = r;
+            print_reg_result(dst, r);
+            break;
+        }
+        case VM_JMP: {
+            int32_t rel = (int32_t)(int16_t)src1;
+            pc = pc + 8 + rel;
+            continue;
+        }
+        case VM_BR: {
+            if (src1 >= ctx.nregs) {
+                fprintf(stderr, "[VM] src1 bounds at 0x%04X\n", pc);
+                goto cleanup;
+            }
+            int32_t rel = (int32_t)(int16_t)src2;
+            int cond = (ctx.r[src1] != 0);
+            if (flg & VM_FLAG_BR_NT) cond = !cond;
+            if (cond)
+                pc = pc + 8 + rel;
+            else
+                pc = pc + 8;
+            continue;
+        }
         case VM_RET:
             printf("[VM] return: %zu (0x%zX)\n", ctx.r[dst], ctx.r[dst]);
             retval = (void *)(uintptr_t)ctx.r[dst];
@@ -227,6 +280,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
             fprintf(stderr, "[VM] bad op 0x%02X at 0x%04X\n", op, pc);
             goto cleanup;
         }
+        pc += 8;
     }
     fprintf(stderr, "[VM] no RET found\n");
 cleanup:

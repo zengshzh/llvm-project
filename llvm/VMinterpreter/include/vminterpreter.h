@@ -17,6 +17,10 @@ enum VM_Opcode {
   VM_STORE  = 0x02,
   VM_LI     = 0x03,
   VM_LI32   = 0x04,
+  VM_MOV    = 0x05,   // rdst = rsrc1
+  VM_CMP    = 0x06,   // rdst = (rsrc1 pred rsrc2) ? 1 : 0
+  VM_JMP    = 0x07,   // pc += (int16_t)src1
+  VM_BR     = 0x08,   // if rsrc1 != 0 then pc += (int16_t)src2
 
   // ── Integer arithmetic ──
   VM_ADD    = 0x10,
@@ -52,6 +56,7 @@ enum VM_Opcode {
 // Flags
 #define VM_FLAG_IMM   4   // bit 2: src2 是 16 位立即数（用于算术/逻辑运算）
 #define VM_FLAG_FLOAT 8   // bit 3: 浮点类型（LOAD/STORE 不符号扩展）
+#define VM_FLAG_BR_NT 1   // bit 0: BR 条件取反（条件为 0 时跳转）
 
 void print_insn(const uint8_t *bc, uint32_t off);
 void hexdump(const uint8_t *bc, uint32_t size);

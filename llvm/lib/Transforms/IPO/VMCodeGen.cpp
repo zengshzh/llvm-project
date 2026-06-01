@@ -22,6 +22,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/Support/Debug.h"
 #include <vector>
@@ -174,6 +175,25 @@ struct RegisterAllocator {
   }
 };
 
+// Map LLVM ICmpInst predicate to VM CMP predicate encoding (flags bits 0-3)
+static uint8_t mapICmpPred(CmpInst::Predicate Pred) {
+  switch (Pred) {
+  case CmpInst::ICMP_EQ:  return 0;
+  case CmpInst::ICMP_NE:  return 1;
+  case CmpInst::ICMP_UGT: return 2;
+  case CmpInst::ICMP_UGE: return 3;
+  case CmpInst::ICMP_ULT: return 4;
+  case CmpInst::ICMP_ULE: return 5;
+  case CmpInst::ICMP_SGT: return 6;
+  case CmpInst::ICMP_SGE: return 7;
+  case CmpInst::ICMP_SLT: return 8;
+  case CmpInst::ICMP_SLE: return 9;
+  default:
+    report_fatal_error(Twine("[VMCodeGen] unsupported icmp predicate: ") +
+                       Twine(Pred) + "\n");
+  }
+}
+
 static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
   // --- Phase 0: count operand uses for liveness ---
   DenseMap<Value *, unsigned> UseCount;
@@ -203,10 +223,30 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
   }
 
   // --- Phase 2: translate to bytecode ---
+  // BB layout order index (used to skip redundant JMP to next block)
+  DenseMap<BasicBlock *, unsigned> BBOrder;
+  unsigned BIdx = 0;
+  for (auto &BB : *F)
+    BBOrder[&BB] = BIdx++;
+
+  // Track actual BB bytecode offsets (recorded at first non-PHI of each BB)
+  DenseMap<BasicBlock *, uint32_t> ActualBBOffset;
+  // Branch patches: placeholder offsets filled in after Phase 2
+  struct BranchPatch {
+    unsigned InstrStart; // BC.size() before emitInsn
+    BasicBlock *Target;
+    bool IsBr;           // false=JMP (src1@+4), true=BR (src2@+6)
+  };
+  std::vector<BranchPatch> Patches;
+
   const DataLayout &DL = F->getParent()->getDataLayout();
   for (auto &BB : *F) {
+    ActualBBOffset[&BB] = BC.size();
     for (auto &I : BB) {
-      if (auto *AI = dyn_cast<AllocaInst>(&I)) {
+      if (isa<PHINode>(&I)) {
+        Regs.alloc(&I); // allocate register, no bytecode emitted
+        continue;
+      } else if (auto *AI = dyn_cast<AllocaInst>(&I)) {
         unsigned RDst = Regs.alloc(AI);
         uint64_t AllocSize = DL.getTypeAllocSize(AI->getAllocatedType());
         emitInsn(BC, VM_ALLOCA, RDst, 0, static_cast<uint16_t>(AllocSize));
@@ -425,6 +465,101 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
               CI->getOpcodeName() + "\n");
         }
         if (SrcIsConst) Regs.freeReg(RSrc);
+      } else if (isa<ICmpInst>(&I)) {
+        auto *IC = cast<ICmpInst>(&I);
+        unsigned RDst = Regs.alloc(&I);
+        // Pre-allocate constant temps BEFORE consuming, so they can't
+        // conflict with freed registers (consume → allocRaw reuse bug).
+        bool S1C = isa<ConstantInt>(IC->getOperand(0));
+        bool S2C = isa<ConstantInt>(IC->getOperand(1));
+        unsigned RSrc1 = S1C ? Regs.allocRaw() : 0;
+        unsigned RSrc2 = S2C ? Regs.allocRaw() : 0;
+        // Now consume (may free registers) / assign non-constant operands
+        if (!S1C) RSrc1 = Regs.consume(IC->getOperand(0));
+        if (!S2C) RSrc2 = Regs.consume(IC->getOperand(1));
+        // Emit LI for constants
+        if (S1C)
+          emitInsn(BC, VM_LI, RSrc1, 0,
+                   static_cast<uint16_t>(cast<ConstantInt>(IC->getOperand(0))->getZExtValue()));
+        if (S2C)
+          emitInsn(BC, VM_LI, RSrc2, 0,
+                   static_cast<uint16_t>(cast<ConstantInt>(IC->getOperand(1))->getZExtValue()));
+        uint8_t PredEnc = mapICmpPred(IC->getPredicate());
+        emitInsn(BC, VM_CMP, RDst, RSrc1, RSrc2, PredEnc);
+        if (S1C) Regs.freeReg(RSrc1);
+        if (S2C) Regs.freeReg(RSrc2);
+      } else if (isa<UncondBrInst>(&I)) {
+        auto *UBI = cast<UncondBrInst>(&I);
+        // --- PHI lowering ---
+        if (auto *Succ = UBI->getSuccessor())
+          for (auto &SI : *Succ) {
+            auto *PN = dyn_cast<PHINode>(&SI);
+            if (!PN) break;
+            Value *Incoming = PN->getIncomingValueForBlock(&BB);
+            unsigned RPhi = Regs.lookupReg(PN);
+            if (auto *CI = dyn_cast<ConstantInt>(Incoming)) {
+              emitInsn(BC, VM_LI, RPhi, 0, static_cast<uint16_t>(CI->getZExtValue()));
+            } else {
+              unsigned RVal = Regs.consume(Incoming);
+              emitInsn(BC, VM_MOV, RPhi, RVal, 0);
+            }
+          }
+        // --- Emit JMP (skip if target is next block in layout) ---
+        {
+          BasicBlock *Target = UBI->getSuccessor();
+          if (BBOrder[Target] != BBOrder[&BB] + 1) {
+            unsigned InstrStart = BC.size();
+            emitInsn(BC, VM_JMP, 0, 0, 0);
+            Patches.push_back({InstrStart, Target, false});
+          }
+        }
+      } else if (isa<CondBrInst>(&I)) {
+        auto *CBI = cast<CondBrInst>(&I);
+        // --- PHI lowering for both successors ---
+        for (unsigned Si = 0; Si < 2; Si++) {
+          BasicBlock *Succ = CBI->getSuccessor(Si);
+          for (auto &SI : *Succ) {
+            auto *PN = dyn_cast<PHINode>(&SI);
+            if (!PN) break;
+            Value *Incoming = PN->getIncomingValueForBlock(&BB);
+            unsigned RPhi = Regs.lookupReg(PN);
+            if (auto *CI = dyn_cast<ConstantInt>(Incoming)) {
+              emitInsn(BC, VM_LI, RPhi, 0, static_cast<uint16_t>(CI->getZExtValue()));
+            } else {
+              unsigned RVal = Regs.consume(Incoming);
+              emitInsn(BC, VM_MOV, RPhi, RVal, 0);
+            }
+          }
+        }
+        // --- Emit BR (taken) + JMP (not-taken) ---
+        // Optimize: skip JMP when either target is the next block in layout.
+        // When the true target is the next block, invert the BR condition
+        // (VM_FLAG_BR_NT) so it jumps to the false target instead,
+        // eliminating both the BR #+0 and the JMP.
+        {
+          Value *Cond = CBI->getCondition();
+          unsigned RCond = Regs.consume(Cond);
+          BasicBlock *TrueTarget = CBI->getSuccessor(0);
+          BasicBlock *FalseTarget = CBI->getSuccessor(1);
+          bool NextIsTrue  = (BBOrder[TrueTarget]  == BBOrder[&BB] + 1);
+          bool NextIsFalse = (BBOrder[FalseTarget] == BBOrder[&BB] + 1);
+
+          if (NextIsTrue) {
+            // Bridge to false target — invert condition flag
+            unsigned BrStart = BC.size();
+            emitInsn(BC, VM_BR, 0, RCond, 0, VM_FLAG_BR_NT);
+            Patches.push_back({BrStart, FalseTarget, true});
+          } else {
+            unsigned BrStart = BC.size();
+            emitInsn(BC, VM_BR, 0, RCond, 0);
+            Patches.push_back({BrStart, TrueTarget, true});
+            if (!NextIsFalse) {
+              unsigned JmpStart = BC.size();
+              emitInsn(BC, VM_JMP, 0, 0, 0);
+              Patches.push_back({JmpStart, FalseTarget, false});
+            }
+          }
+        }
       } else {
         report_fatal_error(
             Twine("[VMCodeGen] unsupported instruction: ") +
@@ -432,6 +567,18 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
       }
     }
   }
+
+  // --- Phase 3: patch branch target offsets ---
+  for (auto &P : Patches) {
+    int32_t Diff = (int32_t)ActualBBOffset[P.Target] - (int32_t)(P.InstrStart + 8);
+    if (Diff < -32768 || Diff > 32767)
+      report_fatal_error("[VMCodeGen] branch target out of 16-bit range\n");
+    uint16_t Enc = (uint16_t)(int16_t)Diff;
+    unsigned Pos = P.IsBr ? P.InstrStart + 6 : P.InstrStart + 4;
+    BC[Pos] = Enc & 0xFF;
+    BC[Pos + 1] = (Enc >> 8) & 0xFF;
+  }
+
   return Regs.MaxReg;
 }
 

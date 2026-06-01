@@ -42,6 +42,11 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     case VM_AND:   printf("  0x%04X: AND    r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_OR:    printf("  0x%04X: OR     r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_XOR:   printf("  0x%04X: XOR    r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
+    case VM_MOV:   printf("  0x%04X: MOV    r%u, r%u\n",       off, dst, src1); break;
+    case VM_CMP:   printf("  0x%04X: CMP    r%u, r%u, r%u  ", off, dst, src1, src2);
+                   printf("(pred=%u)", flg & 0x0F); break;
+    case VM_JMP:   printf("  0x%04X: JMP    #%+d\n",          off, (int16_t)src1); break;
+    case VM_BR:    printf("  0x%04X: BR%s    r%u, #%+d\n",    off, (flg & VM_FLAG_BR_NT)?"!":"", src1, (int16_t)src2); break;
     case VM_RET:   printf("  0x%04X: RET    r%u\n",           off, dst); break;
     default:       printf("  0x%04X: ???    (op=%02X)\n",      off, op); break;
     }
@@ -53,6 +58,12 @@ void hexdump(const uint8_t *bc, uint32_t size) {
         printf("  0x%04X: %02X %02X %02X %02X  %02X %02X %02X %02X\n",
                off, bc[off], bc[off+1], bc[off+2], bc[off+3],
                bc[off+4], bc[off+5], bc[off+6], bc[off+7]);
+    printf("=== [VM ASM START] ===\n");
+    for (uint32_t pc = 0; pc + 8 <= size; pc+=8){
+        print_insn(bc, pc);
+        printf("\n");
+    }
+    printf("=== [VM ASM END] ===\n"); 
 }
 
 void print_reg_result(unsigned reg, uintptr_t val) {
