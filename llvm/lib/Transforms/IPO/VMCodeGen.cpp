@@ -105,42 +105,55 @@ static void emitInsn32(std::vector<uint8_t> &BC, uint8_t Op, uint16_t Dst,
 // Translate IR function to VM bytecode
 //===----------------------------------------------------------------------===//
 
-// RegisterAllocator: dynamic register management with use-count recycling.
-// r0-r7 reserved for function args.  All other registers allocated via
-// free-list and automatically recycled when use count drops to zero.
+// RegisterAllocator: 3-phase dynamic register management.
+// - UseCount: number of remaining operand references.
+// - FreeList: recycled registers, popped by alloc, pushed by freeReg.
+// - DefBB: basic block where each value is defined (cross-BB values never freed).
+// - PHINode registers are never freed (loop-carried values).
+// r0-r7 are reserved for function args and never enter FreeList.
 struct RegisterAllocator {
   unsigned NextReg = 8; // r0-r7 reserved for function args
   unsigned MaxReg = 8;  // at least 8 for r0-r7
   DenseMap<Value *, unsigned> Map;
   SmallVector<unsigned> FreeList;
-  DenseMap<Value *, unsigned> *UseCount;   // not owned
-  DenseMap<Value *, Value *> AliasParent;  // GEP alias → base
+  DenseMap<Value *, unsigned> *UseCount;     // not owned
+  DenseMap<Value *, Value *> AliasParent;    // GEP alias → base
+  DenseMap<Value *, BasicBlock *> DefBB;     // BB where each value is defined
+  BasicBlock *CurrentBB = nullptr;           // BB currently being translated
 
   // Allocate a register and map it to value V (needed for lookups)
   unsigned alloc(Value *V) {
     unsigned r = allocRaw();
     Map[V] = r;
+    if (auto *I = dyn_cast<Instruction>(V))
+      DefBB[V] = I->getParent();
     return r;
   }
 
   // Allocate a temporary register (no Map entry, freed manually)
   unsigned allocRaw() {
     unsigned r;
+#ifdef VM_NO_RECYCLE
+    r = NextReg++;
+#else
     if (!FreeList.empty()) {
       r = FreeList.pop_back_val();
     } else {
       r = NextReg++;
     }
+#endif
     if (r + 1 > MaxReg)
       MaxReg = r + 1;
     return r;
   }
 
   void freeReg(unsigned r) {
+#ifndef VM_NO_RECYCLE
     FreeList.push_back(r);
+#endif
   }
 
-  // Consume an operand: decrement use count, auto-free when done
+  // Consume an operand: decrement use count, auto-free when done.
   unsigned consume(Value *V) {
     unsigned r = Map.lookup(V);
     Value *realV = V;
@@ -148,8 +161,14 @@ struct RegisterAllocator {
       realV = AliasParent[realV];
     if (UseCount) {
       auto It = UseCount->find(realV);
-      if (It != UseCount->end() && --It->second == 0)
-        freeReg(r);
+      if (It != UseCount->end() && --It->second == 0 && !isa<PHINode>(realV)) {
+        // Only free values defined in the current BB. Cross-BB values (e.g.
+        // defined in entry, used in a loop) are never freed — a back-edge
+        // would reuse the register while the value is still live.
+        auto DB = DefBB.find(realV);
+        if (DB != DefBB.end() && DB->second == CurrentBB)
+          freeReg(r);
+      }
     }
     return r;
   }
@@ -241,6 +260,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
 
   const DataLayout &DL = F->getParent()->getDataLayout();
   for (auto &BB : *F) {
+    Regs.CurrentBB = &BB;
     ActualBBOffset[&BB] = BC.size();
     for (auto &I : BB) {
       if (isa<PHINode>(&I)) {
@@ -292,21 +312,19 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
         // GEP: compute pointer = base + byte_offset
         Value *PtrOp = GEP->getPointerOperand();
         APInt Offset(DL.getPointerSizeInBits(), 0);
-        // Pre-allocate new regs BEFORE consume() so they can't collide
-        unsigned RDst = Regs.alloc(&I);
-        unsigned RTmp = Regs.allocRaw();
         unsigned RBase = Regs.consume(PtrOp);
         if (GEP->accumulateConstantOffset(DL, Offset)) {
           if (Offset == 0) {
-            // Zero offset → alias to base register
+            // Zero offset → alias to base register (no bytecode emitted)
             Regs.aliasValue(&I, PtrOp);
-            Regs.freeReg(RDst);  // RDst not needed for alias
-            Regs.freeReg(RTmp);
           } else {
-            // Non-zero offset: rdst = rbase + offset
-            emitInsn(BC, VM_LI, RTmp, 0, static_cast<uint16_t>(Offset.getZExtValue()));
-            emitInsn(BC, VM_ADD, RDst, RBase, RTmp);
-            Regs.freeReg(RTmp);
+            // Non-zero offset: rdst = rbase + #offset
+            // Uses ADD with VM_FLAG_IMM — no separate LI needed, eliminating
+            // the risk of LI overwriting RBase on register collision.
+            unsigned RDst = Regs.alloc(&I);
+            emitInsn(BC, VM_ADD, RDst, RBase,
+                     static_cast<uint16_t>(Offset.getZExtValue()),
+                     VM_FLAG_IMM);
           }
         } else {
           LLVM_DEBUG(dbgs() << "[VMCodeGen] unsupported variable-offset GEP\n");

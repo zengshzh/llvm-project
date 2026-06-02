@@ -35,10 +35,49 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 ## Register Model
 
 - **r0 – r7**: 函数参数寄存器，由 `VMSaveReg` 在函数入口捕获
-- **r8+**: 通用虚拟寄存器，由 bytecode 生成器分配
+- **r8+**: 通用虚拟寄存器，由 bytecode 生成器动态分配和回收
 
 > 寄存器值宽度为 `uintptr_t`（32 位平台 4 字节，64 位平台 8 字节）。
 > 编码字段 16 位（支持 0–65535）。
+
+### 动态寄存器分配算法
+
+`VMCodeGen.cpp` 中的 `RegisterAllocator` 使用三阶段分配：
+
+**Phase 0 — 数据流分析**
+遍历所有 IR 指令的操作数，统计每个 SSA 值被引用的次数（`UseCount`）。
+
+跳过 AllocaInst 结果和 void 指令（不占用虚拟寄存器）。
+
+**Phase 1 — 参数寄存器映射**
+将函数的前 8 个参数固定映射到 `r0–r7`（Map 表）。不会进入回收流程。
+
+**Phase 2 — 指令翻译 + 寄存器分配**
+顺序翻译每条 IR 指令，同时维护寄存器状态：
+
+| 操作 | 说明 |
+|------|------|
+| `alloc(V)` | 为 IR 值 `V` 分配寄存器：优先从 `FreeList` 栈顶取用，否则 `NextReg++` |
+| `allocRaw()` | 分配临时寄存器（不存入 Map，如 LI 的立即数目标） |
+| `consume(V)` | 标记 `V` 被使用了一次：`UseCount[V]--`，如果归零且 `DefBB[V] == 当前 BB`，则回收寄存器到 `FreeList` |
+| `freeReg(r)` | 将寄存器号 `r` 推回 `FreeList` 供后续分配 |
+| `lookupReg(V)` | 查 Map 获取 `V` 的寄存器号（不改变引用计数） |
+| `aliasValue(Alias, Target)` | `Alias`（零偏移 GEP 结果）与 `Target`（基指针）共享同一寄存器，转移 UseCount |
+
+**寄存器回收条件**（必须同时满足）：
+1. `UseCount[V]` 归零（所有引用已消耗）
+2. `V` 不是 PHINode（循环穿越的值不能回收）
+3. **定义 BB == 当前 BB**（跨基本块定义的值可能被循环回边复用，永不回收）
+
+**MaxReg 计算**
+`allocRaw()` 每次分配时更新 `MaxReg = max(MaxReg, r + 1)`。初始值 8（含 r0–r7）。
+最终 `MaxReg` 作为 `nregs` 参数传入 `VMExecute`，VM 入口按需分配 `calloc(nregs, 8)` 字节。
+
+### 寄存器冲突避免
+
+**GEP 非零偏移**使用 `ADD rdst, rbase, #imm` 单指令（`VM_FLAG_IMM`），不经过 LI 临时寄存器，消除 `rbase` 与临时寄存器碰撞的风险。
+
+**Phi 节点**的寄存器永不进入 FreeList，确保循环穿越的值在多轮迭代中不被回收。
 
 ## Opcode Table
 
