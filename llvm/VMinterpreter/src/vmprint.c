@@ -25,6 +25,11 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     case VM_FPTOSI: printf("  0x%04X: FPTOSI r%u, r%u  ",     off, dst, src1); break;
     case VM_FPTRUNC: printf("  0x%04X: FPTRUNC r%u, r%u  ",   off, dst, src1); break;
     case VM_FPEXT:  printf("  0x%04X: FPEXT  r%u, r%u  ",     off, dst, src1); break;
+    case VM_SEXT:   printf("  0x%04X: SEXT   r%u, r%u  ",     off, dst, src1); break;
+    case VM_ZEXT:   printf("  0x%04X: ZEXT   r%u, r%u  ",     off, dst, src1); break;
+    case VM_TRUNC:  printf("  0x%04X: TRUNC  r%u, r%u  ",     off, dst, src1); break;
+    case VM_UITOFP: printf("  0x%04X: UITOFP r%u, r%u  ",     off, dst, src1); break;
+    case VM_FPTOUI: printf("  0x%04X: FPTOUI r%u, r%u  ",     off, dst, src1); break;
     case VM_FADD:  printf("  0x%04X: FADD   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_FSUB:  printf("  0x%04X: FSUB   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
     case VM_FMUL:  printf("  0x%04X: FMUL   r%u, r%u, %s%u  ", off, dst, src1, (flg & VM_FLAG_IMM)?"#":"r", src2); break;
@@ -47,6 +52,10 @@ void print_insn(const uint8_t *bc, uint32_t off) {
                    printf("(pred=%u)", flg & 0x0F); break;
     case VM_JMP:   printf("  0x%04X: JMP    #%+d\n",          off, (int16_t)src1); break;
     case VM_BR:    printf("  0x%04X: BR%s    r%u, #%+d\n",    off, (flg & VM_FLAG_BR_NT)?"!":"", src1, (int16_t)src2); break;
+    case VM_SETARG: printf("  0x%04X: SETARG%s r%u, r%u\n", off, (flg & 1)?"fp ":"   ", dst, src1); break;
+    case VM_CALL:  printf("  0x%04X: CALL%s%s r%u, [%u]\n", off,
+        (flg & VM_CALL_ARG_MIX)?"mx":(flg & VM_CALL_ARG_FP)?"fp":"  ",
+        (flg & VM_CALL_RET_FP)?"r":" ", dst, src1); break;
     case VM_RET:   printf("  0x%04X: RET    r%u\n",           off, dst); break;
     default:       printf("  0x%04X: ???    (op=%02X)\n",      off, op); break;
     }

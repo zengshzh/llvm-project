@@ -93,6 +93,9 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 | 0x06   | CMP      | `CMP rdst, rsrc1, rsrc2`| 比较 rsrc1 与 rsrc2（谓词在 flags 低 4 位），结果 0/1 写入 rdst |
 | 0x07   | JMP      | `JMP #offset`           | 无条件跳转，offset 为有符号 16 位相对偏移 |
 | 0x08   | BR       | `BR rcond, #offset`     | 条件跳转，rcond ≠ 0 时跳转 offset 字节 |
+|        | **函数调用** (0x09-0x0A) | | |
+| 0x09   | SETARG   | `SETARG slot, rsrc`     | 设置调用参数槽。flags bit0=1 浮点→`call_args_fp`，否则→`call_args` |
+| 0x0A   | CALL     | `CALL rdst, [func_idx]` | 调用 `func_table[src1]`。flags bit0=1 读 XMM0 返回，否则读 RAX |
 |        | **整数算术** (0x10–0x1F) | | |
 | 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2 (整数加法)        |
 | 0x11   | SUB      | `SUB rdst, rsrc1, rsrc2`| rdst = rsrc1 - rsrc2 (整数减法)        |
@@ -117,6 +120,9 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 | 0x31   | FPTOSI   | `FPTOSI rdst, rsrc`     | float/double→int32 (bit0=1 → double) |
 | 0x32   | FPTRUNC  | `FPTRUNC rdst, rsrc`    | double→float 截断                     |
 | 0x33   | FPEXT    | `FPEXT rdst, rsrc`      | float→double 扩展                     |
+| 0x34   | SEXT     | `SEXT rdst, rsrc`       | 符号扩展 i32→intptr                  |
+| 0x35   | ZEXT     | `ZEXT rdst, rsrc`       | 零扩展 i32→uintptr                   |
+| 0x36   | TRUNC    | `TRUNC rdst, rsrc`      | 截断至 i32（清空高 32 位）           |
 |        | **特殊** | | |
 | 0xFF   | RET      | `RET rval`              | 返回 `rval` 中的值                   |
 
@@ -183,6 +189,114 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
   - 真目标为下一块：使用 `BR!`（置位 VM_FLAG_BR_NT），条件成立时不跳转（fall through 到真目标），否则跳假目标
   - 以上两情形均可消除冗余 JMP 指令
 
+**SETARG** (0x09)
+- 编码: `[0x09][flags(1)][slot(2)][src_reg(2)][0]`
+- 设置调用参数槽：`ctx.call_args[dst] = ctx.r[src1]`
+- `slot`（dst 字段）取值 0-7，对应 `call_args[slot]`
+- **flags bit 0**：参数类型。0 = 整数/指针 → 写入 `call_args[slot]`（通用寄存器），1 = 浮点 → 写入 `call_args_fp[slot]`（XMM 寄存器）
+- 对可变参数函数（如 `printf`），浮点参数会额外写入 `call_args[slot]`（满足 Win64 变参 shadow 要求）
+
+**CALL** (0x0A)
+- 编码: `[0x0A][flags(1)][ret_reg(2)][func_idx(2)][0]`
+- 调用 `func_table[func_idx]`，返回值存入 `ctx.r[ret_reg]`（`ret_reg = 0` 时忽略）
+- **flags** 使用 2 个独立位控制参数传递方式和返回类型：
+
+  | bit | 常量 | 含义 |
+  |-----|------|------|
+  | 0 | `VM_CALL_RET_FP` | 返回类型：0=RAX（整数/指针），1=XMM0（浮点） |
+  | 1 | `VM_CALL_ARG_FP` | 参数类型：0=整数/指针，1=浮点（仅当全部参数类型一致时设置） |
+  | 2 | `VM_CALL_ARG_MIX` | 参数混合：1=同时存在整数和浮点参数，需用汇编跳板 |
+
+- **6 种分派路径**（4 种函数指针 + 汇编跳板）：
+
+  | flags | 参数 | 返回 | 路径 | 函数指针类型 |
+  |-------|------|------|------|------------|
+  | 0 | 纯整数 | RAX | **VMCallFn** | `void* (*)(void*×8)` |
+  | 1 | 纯整数 | XMM0 | **DblRetCallFn** ← 新！ | `double (*)(void*×8)` |
+  | 2 | 纯浮点 | RAX | FPVMCallFn + truncate | `double (*)(double×8)` |
+  | 3 | 纯浮点 | XMM0 | **FPVMCallFn** | `double (*)(double×8)` |
+  | 4 | 混合 | RAX | 汇编跳板 | `vm_call_trampoline` |
+  | 5 | 混合 | XMM0 | 汇编跳板 | `vm_call_trampoline` |
+
+  各路径说明：
+  - **VMCallFn**：`void*` 参数全部走通用寄存器，`void*` 返回值读 RAX。纯整数参数 + 整数返回的标准路径。
+  - **DblRetCallFn**：`void*` 参数走通用寄存器，但返回值读 **XMM0**。解决 `sin(int)→double` 这类参数是整数但返回值是浮点的场景。
+  - **FPVMCallFn**：`double` 参数走 XMM 寄存器，返回值读 XMM0。纯浮点参数的标准路径。返回 RAX 时截断 `double` 到 `int`。
+  - **汇编跳板**：当参数同时包含整数和浮点类型时，需要同时设置 GP 和 XMM 寄存器，使用 `vm_call_trampoline` 函数。
+
+  参数通过 `SETARG` 预先设置到 `call_args[0..7]`（整数槽 GP 寄存器）和 `call_args_fp[0..7]`（浮点槽 XMM 寄存器）。CodeGen 根据所有参数类型和返回类型自动选择最佳路径。
+
+### 参数传递机制
+
+`VM_CALL` 使用平台相关的汇编跳板实现正确的硬件调用约定。当前支持三个平台：
+
+| 平台 | 汇编文件 | 整数寄存器 | 浮点寄存器 | 栈参数 |
+|------|---------|-----------|-----------|--------|
+| Windows x64 | `vmcall_win64.S` | RCX, RDX, R8, R9 | XMM0-XMM3 | 第 5-8 参数 |
+| Linux x64 | `vmcall_linux64.S` | RDI, RSI, RDX, RCX, R8, R9 | XMM0-XMM7 | 第 7-8 参数 |
+| Linux ARM64 | `vmcall_linux_arm64.S` | X0-X7 | D0-D7 | 第 9+ 参数 |
+
+#### Windows x64 (Microsoft x64 calling convention)
+
+```
+C 调用:
+  vm_call_trampoline(func, int_args, fp_args, &result)
+
+汇编跳板:
+  ┌─ 保存参数（func, int_args, fp_args, result）到栈上
+  ├─ 从 int_args[0..3] 加载 RCX, RDX, R8, R9    ← 整数/指针参数
+  ├─ 从 int_args[4..7] 拷贝到 [RSP+32..63]        ← 第 5-8 个整数参数（栈上）
+  ├─ 从 fp_args[0..3] 加载 XMM0 ~ XMM3          ← 浮点参数
+  ├─ call func                                   ← 统一调用
+  └─ 存储 RAX → result->int_ret, XMM0 → result->fp_ret
+```
+
+寄存器分配：
+
+| 寄存器 | 用途 | 来源 |
+|--------|------|------|
+| RCX | 第 1 个整数/指针参数 | `call_args[0]` |
+| RDX | 第 2 个整数/指针参数 | `call_args[1]` |
+| R8 | 第 3 个整数/指针参数 | `call_args[2]` |
+| R9 | 第 4 个整数/指针参数 | `call_args[3]` |
+| [RSP+32..63] | 第 5-8 个整数/指针参数 | `call_args[4..7]` |
+| XMM0 | 第 1 个浮点参数 | `call_args_fp[0]` |
+| XMM1 | 第 2 个浮点参数 | `call_args_fp[1]` |
+| XMM2 | 第 3 个浮点参数 | `call_args_fp[2]` |
+| XMM3 | 第 4 个浮点参数 | `call_args_fp[3]` |
+| RAX (返回值) | 整数/指针返回值 | `result->int_ret` |
+| XMM0 (返回值) | 浮点返回值 | `result->fp_ret` |
+
+> 对于混合参数（如 `int func(double, int)`），第 1 个浮点参数通过 XMM0 传递，XMM0 对应的 RCX 槽位在 Win64 中未定义。跳板同时设置两种寄存器，函数按类型选择正确的来源。
+
+#### Linux x86-64 (System V AMD64)
+
+| 寄存器 | 用途 | 来源 |
+|--------|------|------|
+| RDI | 第 1 个整数/指针参数 | `call_args[0]` |
+| RSI | 第 2 个整数/指针参数 | `call_args[1]` |
+| RDX | 第 3 个整数/指针参数 | `call_args[2]` |
+| RCX | 第 4 个整数/指针参数 | `call_args[3]` |
+| R8 | 第 5 个整数/指针参数 | `call_args[4]` |
+| R9 | 第 6 个整数/指针参数 | `call_args[5]` |
+| [RSP+0..15] | 第 7-8 个整数/指针参数 | `call_args[6..7]` |
+| XMM0-XMM7 | 第 1-8 个浮点参数 | `call_args_fp[0..7]` |
+| RAX (返回值) | 整数/指针返回值 | `result->int_ret` |
+| XMM0 (返回值) | 浮点返回值 | `result->fp_ret` |
+
+#### Linux ARM64 (AArch64)
+
+| 寄存器 | 用途 | 来源 |
+|--------|------|------|
+| X0-X7 | 第 1-8 个整数/指针参数 | `call_args[0..7]` |
+| D0-D7 | 第 1-8 个浮点参数 | `call_args_fp[0..7]` |
+| X0 (返回值) | 整数/指针返回值 | `result->int_ret` |
+| D0 (返回值) | 浮点返回值 | `result->fp_ret` |
+
+**RET** (0xFF)
+- 编码: `[0xFF][flags(0)][rval(2)][0][0]`
+- 返回 `rval` 中的值
+
 **LI** (0x03)
 - 编码: `[0x03][flags(0)][dst(2)][0][immediate(2)]`
 - 将 16 位立即数零扩展后加载到 `rdst`
@@ -192,9 +306,6 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 - 将 32 位立即数加载到 `rdst`，src1 和 src2 拼接为值：`val = src1 | (src2 << 16)`
 - 用于 float 常量（位模式直接加载）和 > 16 位的整数常量
 
-**RET** (0xFF)
-- 编码: `[0xFF][flags(0)][rval(2)][0][0]`
-- 返回 `rval` 中的值
 
 ## IR → Bytecode Mapping
 
@@ -227,6 +338,9 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 | `fptosi`        | `FPTOSI rdst, rsrc` (float/double→int, flags bit0=1 for double) |
 | `fptrunc`       | `FPTRUNC rdst, rsrc` (double→float) |
 | `fpext`         | `FPEXT rdst, rsrc` (float→double) |
+| `sext`          | `SEXT rdst, rsrc` (i32→intptr 符号扩展) |
+| `zext`          | `ZEXT rdst, rsrc` (i32→uintptr 零扩展) |
+| `trunc`         | `TRUNC rdst, rsrc` (intptr→i32 截断) |
 | `const int`     | `LI rdst, #imm` |
 | `const float`   | `LI32 rdst, #imm32` (加载浮点位模式) |
 | `icmp eq/ne/...`| `CMP rdst, rsrc1, rsrc2` (predicate 编码在 flags 低 4 位) |
@@ -249,7 +363,7 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 | 比较 | ✅ ❌ | icmp ✅ / fcmp ✗ |
 | 类型转换 | ✅ ✅ ✅ ✅ ❌ ❌ ❌ ❌ | sitofp, fptosi, fptrunc, fpext ✓ / trunc, zext, sext 等 ✗ |
 | 聚合操作 | ❌ ❌ ❌ ❌ ❌ | extractvalue, insertvalue, 向量操作 |
-| 函数调用 | ❌ | call |
+| 函数调用 | ✅ ✅ | call (SETARG+CALL 汇编跳板，支持整数/浮点参数及返回值) |
 
 ## 未支持的 IR 指令
 
@@ -301,12 +415,6 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 | `insertelement` | 向量设值 |
 | `shufflevector` | 向量重排 |
 
-### 函数调用
-
-| IR 指令 | 说明 |
-|---------|------|
-| `call` | 调用其他函数（含 `@llvm.*` 内联函数） |
-
 ## Runtime Interface
 
 在 VMP 注解函数的入口，LLVM pass 依次插入两个调用：
@@ -319,6 +427,11 @@ VMExecute(bytecode, size, nregs);     // 执行 bytecode，返回 void*
 - `VMSaveReg` 将函数参数的运行时值存入 VM 寄存器供 bytecode 使用
 - `VMExecute` 开始解释执行 bytecode，第三个参数 `nregs` 指示 VM 上下文需要分配的寄存器数量（**r0–r(nregs-1)**，由 CodeGen 的 Use-count 回收算法计算的最大并发寄存器数）
 - 返回值通过 `(rettype)VMExecute(...)` 转换
+
+## 未支持的特性
+
+* 全局变量
+* 虚拟内存和真实内存地址的转换（函数传参时触发崩溃）
 
 ## Example
 

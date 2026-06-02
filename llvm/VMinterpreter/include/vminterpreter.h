@@ -21,6 +21,8 @@ enum VM_Opcode {
   VM_CMP    = 0x06,   // rdst = (rsrc1 pred rsrc2) ? 1 : 0
   VM_JMP    = 0x07,   // pc += (int16_t)src1
   VM_BR     = 0x08,   // if rsrc1 != 0 then pc += (int16_t)src2
+  VM_SETARG = 0x09,   // ctx.call_args[dst] = ctx.r[src1]
+  VM_CALL   = 0x0A,   // call func_table[src1], ret → rdst
 
   // ── Integer arithmetic ──
   VM_ADD    = 0x10,
@@ -48,6 +50,11 @@ enum VM_Opcode {
   VM_FPTOSI = 0x31,
   VM_FPTRUNC = 0x32,
   VM_FPEXT  = 0x33,
+  VM_SEXT   = 0x34,  // sign-extend lower 32 bits → full uintptr_t
+  VM_ZEXT   = 0x35,  // zero-extend lower 32 bits → full uintptr_t
+  VM_TRUNC  = 0x36,  // truncate to lower 32 bits (zero upper)
+  VM_UITOFP = 0x37,  // unsigned int → float/double
+  VM_FPTOUI = 0x38,  // float/double → unsigned int
 
   // ── Special ──
   VM_RET    = 0xFF,
@@ -58,10 +65,16 @@ enum VM_Opcode {
 #define VM_FLAG_FLOAT 8   // bit 3: 浮点类型（LOAD/STORE 不符号扩展）
 #define VM_FLAG_BR_NT 1   // bit 0: BR 条件取反（条件为 0 时跳转）
 
+// CALL 标志位（与通用 flags 共用字节）
+#define VM_CALL_RET_FP   1   // bit 0: 返回值在 XMM0（浮点），否则 RAX（整数）
+#define VM_CALL_ARG_FP   2   // bit 1: 参数全为浮点 → FPVMCallFn
+#define VM_CALL_ARG_MIX  4   // bit 2: 参数混合整数+浮点 → 汇编跳板
+
 void print_insn(const uint8_t *bc, uint32_t off);
 void hexdump(const uint8_t *bc, uint32_t size);
 void print_reg_result(unsigned reg, uintptr_t val);
-void *VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs);
+void *VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs,
+                void (**func_table)(void), uint32_t func_count);
 void VMSaveReg(void *r0, void *r1, void *r2, void *r3,
                void *r4, void *r5, void *r6, void *r7);
 

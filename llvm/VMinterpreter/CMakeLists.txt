@@ -14,6 +14,15 @@ set(VMINTERPRETER_SOURCES
     src/vmexecute.c
 )
 
+# Platform-specific CALL trampoline
+if(WIN32)
+    list(APPEND VMINTERPRETER_SOURCES src/vmcall_win64.S)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+    list(APPEND VMINTERPRETER_SOURCES src/vmcall_linux_arm64.S)
+else()
+    list(APPEND VMINTERPRETER_SOURCES src/vmcall_linux64.S)
+endif()
+
 # Static library (no LLVM dependency)
 add_library(vminterpreter STATIC
     ${VMINTERPRETER_SOURCES}

@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/Debug.h"
 #include <vector>
 
@@ -213,7 +214,9 @@ static uint8_t mapICmpPred(CmpInst::Predicate Pred) {
   }
 }
 
-static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
+static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
+                            std::vector<std::string> &FuncNames,
+                            DenseMap<StringRef, unsigned> &FuncNameMap) {
   // --- Phase 0: count operand uses for liveness ---
   DenseMap<Value *, unsigned> UseCount;
   for (auto &BB : *F) {
@@ -248,6 +251,14 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
   for (auto &BB : *F)
     BBOrder[&BB] = BIdx++;
 
+  // Pre-allocate phi node registers BEFORE Phase 2 main loop, so that phi
+  // lowering at predecessor branches (which happens when the predecessor BB is
+  // processed, earlier than the phi's own BB) can look up the correct register.
+  for (auto &BB : *F)
+    for (auto &I : BB)
+      if (isa<PHINode>(&I))
+        Regs.alloc(&I);
+
   // Track actual BB bytecode offsets (recorded at first non-PHI of each BB)
   DenseMap<BasicBlock *, uint32_t> ActualBBOffset;
   // Branch patches: placeholder offsets filled in after Phase 2
@@ -264,8 +275,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
     ActualBBOffset[&BB] = BC.size();
     for (auto &I : BB) {
       if (isa<PHINode>(&I)) {
-        Regs.alloc(&I); // allocate register, no bytecode emitted
-        continue;
+        continue; // already allocated in pre-pass above
       } else if (auto *AI = dyn_cast<AllocaInst>(&I)) {
         unsigned RDst = Regs.alloc(AI);
         uint64_t AllocSize = DL.getTypeAllocSize(AI->getAllocatedType());
@@ -288,8 +298,8 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
         uint8_t SFlags = (DL.getTypeStoreSize(ValOp->getType()) > 4) ? 1 : 0;
         if (ValOp->getType()->isFloatTy()) SFlags |= VM_FLAG_FLOAT;
 
-        if (auto *AllocaPtr = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
-          unsigned RAddr = Regs.lookupReg(AllocaPtr);
+        if (isa<AllocaInst>(getUnderlyingObject(PtrOp))) {
+          unsigned RAddr = Regs.lookupReg(PtrOp);
           emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
         } else {
           unsigned RAddr = Regs.consume(PtrOp);
@@ -301,8 +311,8 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
         uint8_t LFlags = (DL.getTypeStoreSize(LI->getType()) > 4) ? 1 : 0;
         if (LI->getType()->isFloatTy()) LFlags |= VM_FLAG_FLOAT;
 
-        if (auto *AllocaPtr = dyn_cast<AllocaInst>(PtrOp->stripPointerCasts())) {
-          unsigned RAddr = Regs.lookupReg(AllocaPtr);
+        if (isa<AllocaInst>(getUnderlyingObject(PtrOp))) {
+          unsigned RAddr = Regs.lookupReg(PtrOp);
           emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
         } else {
           unsigned RAddr = Regs.consume(PtrOp);
@@ -477,6 +487,25 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
         case Instruction::FPExt:
           emitInsn(BC, VM_FPEXT, RDst, RSrc, 0);
           break;
+        case Instruction::SExt:
+          emitInsn(BC, VM_SEXT, RDst, RSrc, 0);
+          break;
+        case Instruction::ZExt:
+          emitInsn(BC, VM_ZEXT, RDst, RSrc, 0);
+          break;
+        case Instruction::Trunc:
+          emitInsn(BC, VM_TRUNC, RDst, RSrc, 0);
+          break;
+        case Instruction::UIToFP: {
+          uint8_t CF = CI->getDestTy()->isDoubleTy() ? 1 : 0;
+          emitInsn(BC, VM_UITOFP, RDst, RSrc, 0, CF);
+          break;
+        }
+        case Instruction::FPToUI: {
+          uint8_t CF = CI->getSrcTy()->isDoubleTy() ? 1 : 0;
+          emitInsn(BC, VM_FPTOUI, RDst, RSrc, 0, CF);
+          break;
+        }
         default:
           report_fatal_error(
               Twine("[VMCodeGen] unsupported cast: ") +
@@ -578,6 +607,60 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC) {
             }
           }
         }
+      } else if (auto *CI = dyn_cast<CallInst>(&I)) {
+        Function *Callee = CI->getCalledFunction();
+        if (!Callee)
+          report_fatal_error("[VMCodeGen] indirect calls not supported\n");
+        unsigned NArgs = CI->arg_size();
+        auto It = FuncNameMap.find(Callee->getName());
+        if (It == FuncNameMap.end()) {
+          It = FuncNameMap.insert({Callee->getName(), FuncNames.size()}).first;
+          FuncNames.push_back(Callee->getName().str());
+        }
+        unsigned FuncIdx = It->second;
+        // Determine arg types for CALL dispatch mode
+        bool AllInt = true, AllFP = true;
+        for (unsigned i = 0; i < NArgs && i < 8; i++) {
+          Type *T = CI->getArgOperand(i)->getType();
+          if (T->isFloatTy() || T->isDoubleTy()) AllInt = false;
+          else AllFP = false;
+        }
+        bool RetFP = CI->getType()->isFloatTy() || CI->getType()->isDoubleTy();
+
+        bool IsVarArg = Callee->isVarArg();
+        for (unsigned i = 0; i < NArgs && i < 8; i++) {
+          unsigned RArg;
+          Type *ArgTy = CI->getArgOperand(i)->getType();
+          bool IsFP = ArgTy->isFloatTy() || ArgTy->isDoubleTy();
+          uint8_t ArgFlags = IsFP ? 1 : 0;
+          if (auto *CInt = dyn_cast<ConstantInt>(CI->getArgOperand(i))) {
+            RArg = Regs.allocRaw();
+            emitInsn(BC, VM_LI, RArg, 0, static_cast<uint16_t>(CInt->getZExtValue()));
+          } else if (auto *CFP = dyn_cast<ConstantFP>(CI->getArgOperand(i))) {
+            RArg = Regs.allocRaw();
+            uint32_t Bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
+            emitInsn32(BC, VM_LI32, RArg, Bits);
+          } else {
+            RArg = Regs.consume(CI->getArgOperand(i));
+          }
+          emitInsn(BC, VM_SETARG, i, RArg, 0, ArgFlags);
+          // Variadic functions need fp args in BOTH XMM and GP slots
+          if (IsVarArg && IsFP)
+            emitInsn(BC, VM_SETARG, i, RArg, 0, 0);  // also → call_args[i]
+        }
+        unsigned RetReg = CI->getType()->isVoidTy() ? 0 : Regs.alloc(&I);
+        // Select CALL flags:
+        //   bit 0: VM_CALL_RET_FP  — 1=fp return (XMM0)
+        //   bit 1: VM_CALL_ARG_FP  — 1=all fp args (FPVMCallFn)
+        //   bit 2: VM_CALL_ARG_MIX — 1=mixed int+fp args (assembly)
+        uint8_t CallFlags = (RetFP ? VM_CALL_RET_FP : 0);
+        if (!AllInt && !AllFP) {
+          CallFlags |= VM_CALL_ARG_MIX;   // mixed → assembly trampoline
+        } else if (AllFP) {
+          CallFlags |= VM_CALL_ARG_FP;    // pure fp → FPVMCallFn
+        }
+        // else pure int → VMCallFn or DblRetCallFn (based on ret type)
+        emitInsn(BC, VM_CALL, RetReg, FuncIdx, 0, CallFlags);
       } else {
         report_fatal_error(
             Twine("[VMCodeGen] unsupported instruction: ") +
@@ -609,7 +692,9 @@ static void insertVmpcall(Function *F) {
 
   // Generate bytecode
   std::vector<uint8_t> BC;
-  unsigned MaxRegs = genBytecode(F, BC);
+  std::vector<std::string> FuncNames;
+  DenseMap<StringRef, unsigned> FuncNameMap;
+  unsigned MaxRegs = genBytecode(F, BC, FuncNames, FuncNameMap);
 
   if (BC.empty())
     return;
@@ -635,9 +720,32 @@ static void insertVmpcall(Function *F) {
 
   Type *Int8PtrTy = PointerType::get(Ctx, 0);
 
-  // Declare: void *VMExecute(ptr, i32, i32)
+  // Create function table global (array of function pointers)
+  Constant *FnTableGV = nullptr;
+  unsigned FuncCount = FuncNames.size();
+  if (FuncCount > 0) {
+    std::vector<Constant *> FnPtrs;
+    for (auto &Name : FuncNames) {
+      FunctionCallee Callee = M->getOrInsertFunction(Name, Int8PtrTy);
+      auto *CalleeC = cast<Constant>(Callee.getCallee());
+      FnPtrs.push_back(ConstantExpr::getPointerCast(CalleeC, Int8PtrTy));
+    }
+    auto *FnArrTy = ArrayType::get(Int8PtrTy, FuncCount);
+    Constant *FnInit = ConstantArray::get(FnArrTy, FnPtrs);
+    auto *GV = new GlobalVariable(*M, FnArrTy, true,
+                                  GlobalValue::PrivateLinkage, FnInit,
+                                  ".vmp_fn_table");
+    GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+    Constant *FnIndices[] = {Zero, Zero};
+    FnTableGV = ConstantExpr::getInBoundsGetElementPtr(FnArrTy, GV, FnIndices);
+  } else {
+    FnTableGV = Constant::getNullValue(Int8PtrTy);
+  }
+  Constant *FuncCountC = ConstantInt::get(Int32Ty, FuncCount);
+
+  // Declare: void *VMExecute(ptr, i32, i32, ptr, i32)
   FunctionType *ExecFnTy = FunctionType::get(
-      Int8PtrTy, {Int8PtrTy, Int32Ty, Int32Ty}, false);
+      Int8PtrTy, {Int8PtrTy, Int32Ty, Int32Ty, Int8PtrTy, Int32Ty}, false);
   FunctionCallee VmExec = M->getOrInsertFunction("VMExecute", ExecFnTy);
 
   // Declare: void VMSaveReg(ptr, ptr, ..., ptr)  — 8 register values
@@ -685,7 +793,7 @@ static void insertVmpcall(Function *F) {
 
   // 2) VMExecute(bytecode_ptr, size, nregs)
   Constant *NRegs = ConstantInt::get(Int32Ty, MaxRegs);
-  CallInst *Result = B.CreateCall(VmExec, {BCPtr, Size, NRegs});
+  CallInst *Result = B.CreateCall(VmExec, {BCPtr, Size, NRegs, FnTableGV, FuncCountC});
 
   // 3) Cast and return
   if (RetTy->isVoidTy()) {

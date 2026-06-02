@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <math.h>
 #include "vminterpreter.h"
 
 // Saved register values from VMSaveReg, consumed by VMExecute
@@ -30,6 +32,9 @@ typedef struct {
     uint8_t   *m;
     size_t     mcap;
     uint32_t   vm_sp;
+    void      *call_args[8];      // integer/pointer arg slots
+    double     call_args_fp[8];   // float/double arg slots
+    double     ret_fp;            // float/double return value
 } VMContext;
 
 // ---- helper: resolve src2 (register or immediate) — returns 0 on success ----
@@ -43,8 +48,30 @@ static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t p
     return 0;
 }
 
+// 4 universal call types for dispatch without assembly
+// Type 1: int args → GP regs, int ret ← RAX
+typedef void *(*VMCallFn)(void*, void*, void*, void*,
+                          void*, void*, void*, void*);
+// Type 2: int args → GP regs, fp ret ← XMM0
+typedef double (*DblRetCallFn)(void*, void*, void*, void*,
+                               void*, void*, void*, void*);
+// Type 3: fp args → XMM regs, int ret ← RAX (rare, truncate)
+// Type 4: fp args → XMM regs, fp ret ← XMM0
+typedef double (*FPVMCallFn)(double, double, double, double,
+                             double, double, double, double);
+
+// Assembly trampoline for mixed int/fp arguments
+struct vmcall_result {
+    uintptr_t int_ret;
+    double    fp_ret;
+};
+extern void vm_call_trampoline(void *func, void **int_args,
+                               double *fp_args,
+                               struct vmcall_result *result);
+
 // ---- execution engine ----
-void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
+void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
+                void (**func_table)(void), uint32_t func_count) {
     hexdump(bc, size);
     printf("=== VM bytecode (%u bytes, %u regs) ===\n", size, nregs);
 
@@ -68,8 +95,16 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
 
         print_insn(bc, pc);
 
-        // JMP/BR use src1/src2 as offsets, not register indices
-        if (op != VM_JMP && op != VM_BR) {
+        // Special instructions that don't use standard register fields
+        if (op == VM_JMP || op == VM_BR || op == VM_SETARG || op == VM_CALL) {
+            // Bounds check only the register-referencing fields
+            if (op == VM_SETARG && src1 > 0 && src1 >= ctx.nregs) {
+                fprintf(stderr, "[VM] src1 bounds at 0x%04X\n", pc); goto cleanup;
+            }
+            if (op == VM_CALL && dst > 0 && dst >= ctx.nregs) {
+                fprintf(stderr, "[VM] dst bounds at 0x%04X\n", pc); goto cleanup;
+            }
+        } else {
             if (dst >= ctx.nregs || src1 >= ctx.nregs) {
                 fprintf(stderr, "[VM] reg bounds at 0x%04X\n", pc);
                 goto cleanup;
@@ -205,6 +240,44 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
             print_reg_result(dst, ctx.r[dst]);
             break;
         }
+        case VM_SEXT: {
+            int32_t tmp; memcpy(&tmp, &ctx.r[src1], 4);
+            ctx.r[dst] = (intptr_t)tmp;
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        }
+        case VM_ZEXT: {
+            uint32_t tmp; memcpy(&tmp, &ctx.r[src1], 4);
+            ctx.r[dst] = tmp;
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        }
+        case VM_TRUNC: {
+            ctx.r[dst] = (uint32_t)ctx.r[src1];
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        }
+        case VM_UITOFP: {
+            uint32_t tmp; memcpy(&tmp, &ctx.r[src1], 4);
+            if (flg & 1) {
+                double d = (double)tmp; memcpy(&ctx.r[dst], &d, 8);
+            } else {
+                float f = (float)tmp; memcpy(&ctx.r[dst], &f, 4);
+            }
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        }
+        case VM_FPTOUI: {
+            uint32_t ui;
+            if (flg & 1) {
+                double d; memcpy(&d, &ctx.r[src1], 8); ui = (uint32_t)d;
+            } else {
+                float f; memcpy(&f, &ctx.r[src1], 4); ui = (uint32_t)f;
+            }
+            ctx.r[dst] = ui;
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        }
         case VM_FADD:  { FLOAT_BINOP(+); break; }
         case VM_FSUB:  { FLOAT_BINOP(-); break; }
         case VM_FMUL:  { FLOAT_BINOP(*); break; }
@@ -271,6 +344,67 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs) {
             else
                 pc = pc + 8;
             continue;
+        }
+        case VM_SETARG:
+            if (dst < 8) {
+                if (flg & 1)  // float/double arg
+                    memcpy(&ctx.call_args_fp[dst], &ctx.r[src1], sizeof(double));
+                else          // integer/pointer arg
+                    ctx.call_args[dst] = (void *)ctx.r[src1];
+            }
+            break;
+        case VM_CALL: {
+            if (src1 >= func_count || !func_table) {
+                fprintf(stderr, "[VM] bad func idx %u at 0x%04X\n", src1, pc);
+                goto cleanup;
+            }
+            void *func = func_table[src1];
+
+            if (flg & VM_CALL_ARG_MIX) {
+                // ── Mixed int+fp args: use assembly trampoline (case 5-6) ──
+                struct vmcall_result res;
+                vm_call_trampoline(func, ctx.call_args, ctx.call_args_fp, &res);
+                if (dst) {
+                    if (flg & VM_CALL_RET_FP) memcpy(&ctx.r[dst], &res.fp_ret, 8);
+                    else                      ctx.r[dst] = res.int_ret;
+                }
+            } else if (flg & VM_CALL_ARG_FP) {
+                // ── Pure fp args: use FPVMCallFn (case 3-4) ──
+                FPVMCallFn fn = (FPVMCallFn)func;
+                double r = fn(ctx.call_args_fp[0], ctx.call_args_fp[1],
+                              ctx.call_args_fp[2], ctx.call_args_fp[3],
+                              ctx.call_args_fp[4], ctx.call_args_fp[5],
+                              ctx.call_args_fp[6], ctx.call_args_fp[7]);
+                if (dst) {
+                    if (flg & VM_CALL_RET_FP)
+                        memcpy(&ctx.r[dst], &r, 8);
+                    else
+                        ctx.r[dst] = (uintptr_t)(intptr_t)(int32_t)r;  // truncate double→int
+                }
+            } else {
+                // ── Pure int args: use VMCallFn or DblRetCallFn (case 1-2) ──
+                if (flg & VM_CALL_RET_FP) {
+                    // Case 2: int args + fp ret → DblRetCallFn (reads XMM0)
+                    DblRetCallFn fn = (DblRetCallFn)func;
+                    double r = fn(ctx.call_args[0], ctx.call_args[1],
+                                  ctx.call_args[2], ctx.call_args[3],
+                                  ctx.call_args[4], ctx.call_args[5],
+                                  ctx.call_args[6], ctx.call_args[7]);
+                    if (dst) memcpy(&ctx.r[dst], &r, 8);
+                } else {
+                    // Case 1: int args + int ret → VMCallFn (reads RAX)
+                    VMCallFn fn = (VMCallFn)func;
+                    void *r = fn(ctx.call_args[0], ctx.call_args[1],
+                                 ctx.call_args[2], ctx.call_args[3],
+                                 ctx.call_args[4], ctx.call_args[5],
+                                 ctx.call_args[6], ctx.call_args[7]);
+                    if (dst) ctx.r[dst] = (uintptr_t)r;
+                }
+            }
+            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+            if (dst) print_reg_result(dst, ctx.r[dst]);
+            break;
         }
         case VM_RET:
             printf("[VM] return: %zu (0x%zX)\n", ctx.r[dst], ctx.r[dst]);
