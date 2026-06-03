@@ -327,7 +327,8 @@ C 调用:
 | `br i1 cond, label, label` | `BR rcond, #offset` (true → BR, false → JMP，相邻目标时优化 JMP)` |
 | `phi`           | 降级为 `MOV` 指令，在前驱块末尾插入，当前块跳过生成 |
 | `switch val, default, [c1→bb1, ...]` | `LI #c; CMP; BR` 链 + phi 降级 |
-| `getelementptr` | 常量偏移 → `ADD rdst, rbase, #imm` (`VM_FLAG_IMM`)；变量偏移 → `MOV rtmp, rbase` + `ADD rtmp, rtmp, ridx`(×elem_size) + `MOV rdst, rtmp` |
+| `getelementptr` | 普通基址：常量偏移→`ADD rdst, rbase, #imm`；变量偏移→`MOV rtmp, rbase` + … |
+| | 全局变量基址：`MOV rdst, r_global`（被零偏移 GEP 优化掉时通过 CALL 参数直接引用）|
 
 **总进度： 9/10 类指令已支持（`█████████░`）**
 
@@ -389,21 +390,47 @@ C 调用:
 
 ## Runtime Interface
 
-在 VMP 注解函数的入口，LLVM pass 依次插入两个调用：
+在 VMP 注解函数的入口，LLVM pass 依次插入以下调用：
 
 ```
 VMSaveReg(r0, r1, ..., r7);           // 捕获 8 个函数参数作为 VM 寄存器初始值
-VMExecute(bytecode, size, nregs);     // 执行 bytecode，返回 void*
+// [可选] 全局变量地址表（函数涉及全局变量时插入）
+// VMExecute 根据此表将全局变量地址填入对应的 VM 寄存器
+VMExecute(bytecode, size, nregs, func_table, func_count,
+          global_init, num_globals);  // 执行 bytecode，返回 void*
 ```
 
 - `VMSaveReg` 将函数参数的运行时值存入 VM 寄存器供 bytecode 使用
-- `VMExecute` 开始解释执行 bytecode，第三个参数 `nregs` 指示 VM 上下文需要分配的寄存器数量（**r0–r(nregs-1)**，由 CodeGen 的 Use-count 回收算法计算的最大并发寄存器数）
-- 返回值通过 `(rettype)VMExecute(...)` 转换
+- `VMExecute` 开始解释执行 bytecode，第三参数 `nregs` 指示 VM 上下文需要分配的寄存器数量（**r0–r(nregs-1)**，由 CodeGen 的 Use-count 回收算法计算的最大并发寄存器数）
+- 全局变量通过 `{reg, value}` 对表传递：`global_init` 交替存放 `[reg0, val0, reg1, val1, ...]`，VM 启动时遍历此表将 `value` 写入 `ctx.r[reg]`
 
-## 未支持的特性
+### 全局变量支持
 
-* 全局变量
-* 虚拟内存和真实内存地址的转换（函数传参时触发崩溃）
+当 VMP 函数引用全局变量时，VMCodeGen 自动执行以下步骤：
+
+1. **寄存器分配**：`genBytecode()` 中通过 `getGlobalReg(GV)` 为每个唯一 `GlobalVariable` 分配一个 VM 寄存器（`Regs.NextReg++`，位于普通虚拟寄存器之后）
+2. **字节码引用**：遇到以下情形时使用全局寄存器而非 `r0`（缺省值）：
+   - GEP 的基址是 `GlobalVariable` → `MOV rdst, r_global`
+   - LOAD/STORE 的指针操作数 → 直接使用 `r_global`
+   - CALL 的参数是 `GlobalVariable`（零偏移 GEP 被优化后） → 同 SETARG 使用 `r_global`
+3. **地址注入**：`insertVmpcall()` 生成 LLVM IR 代码，计算每个全局变量的运行时地址（`ptrtoint`），存入 `{reg, value}` 对表，传入 `VMExecute`
+
+VM 启动时遍历该表，将地址填入对应寄存器，后续字节码即可通过全局寄存器访问全局变量。
+
+#### 示例
+
+```c
+char teststr[] = "asdadajijiopjq";
+int  testint   = 8;
+
+__attribute__((annotate("VMP")))
+void test(Results *r) {
+    r->global_r = strlen(teststr) + testint;  // teststr、testint 为全局变量
+}
+```
+
+生成的字节码中，`teststr` 被分配全局寄存器 rN，`testint` 被分配 rN+1。`strlen` 的参数通过 `SETARG r0, rN` 传入，`load i32, i32* @testint` 通过 `LOAD.4 rdst, r(N+1)` 执行。
+
 
 ## Example
 

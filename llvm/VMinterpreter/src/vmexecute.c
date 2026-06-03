@@ -77,7 +77,8 @@ extern void vm_call_trampoline(void *func, void **int_args,
 
 // ---- execution engine ----
 void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
-                void (**func_table)(void), uint32_t func_count) {
+                void (**func_table)(void), uint32_t func_count,
+                const uintptr_t *global_init, uint32_t num_globals) {
     hexdump(bc, size);
     print_vm_header(size, nregs);
 
@@ -106,6 +107,14 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
     // Restore argument registers saved by VMSaveReg
     for (int i = 0; i < 8 && i < (int)nregs; i++)
         ctx.r[i] = gpr[i];
+
+    // Load global variable addresses from {reg, value} pair table.
+    // global_init alternates: [reg0, val0, reg1, val1, ...]
+    for (uint32_t i = 0; i + 1 < num_globals * 2 && i + 1 < (uint32_t)nregs * 2; i += 2) {
+        unsigned r = (unsigned)global_init[i];
+        if (r < (uint32_t)nregs)
+            ctx.r[r] = global_init[i + 1];
+    }
 
     void *retval = NULL;
 

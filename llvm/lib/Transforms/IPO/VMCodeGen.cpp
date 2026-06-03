@@ -238,9 +238,16 @@ static uint8_t mapICmpPred(CmpInst::Predicate Pred) {
   }
 }
 
+// One global variable referenced by the bytecode + its VM register number.
+struct VMGlobalRef {
+    GlobalVariable *GV;
+    unsigned        Reg;
+};
+
 static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
                             std::vector<std::string> &FuncNames,
-                            DenseMap<StringRef, unsigned> &FuncNameMap) {
+                            DenseMap<StringRef, unsigned> &FuncNameMap,
+                            std::vector<VMGlobalRef> &Globals) {
   // --- Phase 0: count operand uses for liveness ---
   DenseMap<Value *, unsigned> UseCount;
   for (auto &BB : *F) {
@@ -267,6 +274,25 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
       ArgIdx++;
     }
   }
+
+  // Global variable register mapping.
+  // Globals get a dedicated register at the tail of the register file, one
+  // per unique GlobalVariable referenced by the bytecode.  We allocate via
+  // NextReg++ (bypassing FreeList) to avoid collisions with alloca/phi
+  // registers that are drawn from FreeList early in translation.
+  // insertVmpcall fills these registers with the runtime address of the
+  // global before VMExecute runs.
+  DenseMap<GlobalVariable *, unsigned> GlobalRegMap;
+  auto getGlobalReg = [&](GlobalVariable *GV) -> unsigned {
+    auto [It, New] = GlobalRegMap.try_emplace(GV, 0);
+    if (New) {
+      unsigned reg = Regs.NextReg++;
+      if (reg + 1 > Regs.MaxReg) Regs.MaxReg = reg + 1;
+      It->second = reg;
+      Globals.push_back({GV, reg});
+    }
+    return It->second;
+  };
 
   // --- Phase 2: translate to bytecode ---
   // BB layout order index (used to skip redundant JMP to next block)
@@ -323,7 +349,11 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         uint8_t SFlags = (StoreSize - 1) & 0x0F;        // bits 0-3: size-1
 
         // All addresses are real pointers after ALLOCA simplification.
-        unsigned RAddr = Regs.consume(PtrOp);
+        unsigned RAddr;
+        if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts()))
+          RAddr = getGlobalReg(GV);
+        else
+          RAddr = Regs.consume(PtrOp);
         emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
         Value *PtrOp = LI->getPointerOperand();
@@ -334,38 +364,55 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         if (LI->getType()->isFloatTy()) LFlags |= VM_FLAG_FLOAT;
 
         // All addresses are real pointers after ALLOCA simplification.
-        unsigned RAddr = Regs.consume(PtrOp);
+        unsigned RAddr;
+        if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts()))
+          RAddr = getGlobalReg(GV);
+        else
+          RAddr = Regs.consume(PtrOp);
         emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         // GEP: compute pointer = base + byte_offset
         Value *PtrOp = GEP->getPointerOperand();
         APInt Offset(DL.getPointerSizeInBits(), 0);
-        unsigned RBase = Regs.lookupReg(PtrOp);
+
+        // When the pointer operand is a GlobalVariable, use a dedicated global
+        // register (filled with the runtime address by VMExecute init).  The
+        // normal RegisterAllocator has no entry for globals, so lookupReg
+        // would return 0 (r0) which is wrong.
+        bool IsGlobal = false;
+        unsigned RBase;
+        if (auto *GV = dyn_cast<GlobalVariable>(PtrOp->stripPointerCasts())) {
+          RBase = getGlobalReg(GV);
+          IsGlobal = true;
+        } else {
+          RBase = Regs.lookupReg(PtrOp);
+        }
+
         if (GEP->accumulateConstantOffset(DL, Offset)) {
           if (Offset == 0) {
-            // Zero offset → alias to base register (no bytecode emitted)
-            Regs.aliasValue(&I, PtrOp);
-            Regs.consume(PtrOp);
+            if (IsGlobal) {
+              // Global + 0: MOV the global address to the GEP result register
+              unsigned RDst = Regs.alloc(&I);
+              emitInsn(BC, VM_MOV, RDst, RBase, 0);
+            } else {
+              // Zero offset → alias to base register (no bytecode emitted)
+              Regs.aliasValue(&I, PtrOp);
+              Regs.consume(PtrOp);
+            }
           } else {
             // Non-zero offset: rdst = rbase + #offset
-            // Uses ADD with VM_FLAG_IMM — no separate LI needed, eliminating
-            // the risk of LI overwriting RBase on register collision.
             unsigned RDst = Regs.alloc(&I);
             emitInsn(BC, VM_ADD, RDst, RBase,
                      static_cast<uint16_t>(Offset.getZExtValue()),
                      VM_FLAG_IMM);
-            Regs.consume(PtrOp);
+            if (!IsGlobal) Regs.consume(PtrOp);
           }
         } else {
           // Variable-offset GEP: assemble pointer = base + sum(idx_i * elem_size_i)
-          // Supports arr[i] patterns where one or more indices are runtime values.
           unsigned RDst = Regs.alloc(&I);
 	  unsigned RAcc = Regs.allocRaw();
-          // Capture base into RAcc BEFORE consuming PtrOp, so register recycling
-          // (PtrOp → FreeList → another IR value) can't overwrite the base value
-          // before we've saved it.  consume(PtrOp) follows so use-count stays correct.
           emitInsn(BC, VM_MOV, RAcc, RBase, 0);
-          Regs.consume(PtrOp);
+          if (!IsGlobal) Regs.consume(PtrOp);
 
           gep_type_iterator GTI = gep_type_begin(GEP);
           for (unsigned IdxNo = 1; IdxNo < GEP->getNumOperands(); ++IdxNo, ++GTI) {
@@ -780,6 +827,11 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
             RArg = Regs.allocRaw();
             uint32_t Bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
             emitInsn32(BC, VM_LI32, RArg, Bits);
+          } else if (auto *GV = dyn_cast<GlobalVariable>(
+                         CI->getArgOperand(i)->stripPointerCasts())) {
+            // LLVM may optimise away a zero-offset GEP and use the global
+            // variable directly.  Assign a global register for its address.
+            RArg = getGlobalReg(GV);
           } else {
             RArg = Regs.consume(CI->getArgOperand(i));
           }
@@ -820,6 +872,9 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
     BC[Pos + 1] = (Enc >> 8) & 0xFF;
   }
 
+  // Global registers were already allocated via NextReg++ inside getGlobalReg,
+  // so NextReg / MaxReg already account for them.
+
   return Regs.MaxReg;
 }
 
@@ -834,7 +889,8 @@ static void insertVmpcall(Function *F) {
   std::vector<uint8_t> BC;
   std::vector<std::string> FuncNames;
   DenseMap<StringRef, unsigned> FuncNameMap;
-  unsigned MaxRegs = genBytecode(F, BC, FuncNames, FuncNameMap);
+  std::vector<VMGlobalRef> Globals;
+  unsigned MaxRegs = genBytecode(F, BC, FuncNames, FuncNameMap, Globals);
 
   if (BC.empty())
     return;
@@ -883,9 +939,12 @@ static void insertVmpcall(Function *F) {
   }
   Constant *FuncCountC = ConstantInt::get(Int32Ty, FuncCount);
 
-  // Declare: void *VMExecute(ptr, i32, i32, ptr, i32)
+  // Declare: void *VMExecute(ptr, i32, i32, ptr, i32, ptr, i32)
+  // The last two parameters are (global_init[], num_globals).
   FunctionType *ExecFnTy = FunctionType::get(
-      Int8PtrTy, {Int8PtrTy, Int32Ty, Int32Ty, Int8PtrTy, Int32Ty}, false);
+      Int8PtrTy,
+      {Int8PtrTy, Int32Ty, Int32Ty, Int8PtrTy, Int32Ty, Int8PtrTy, Int32Ty},
+      false);
   FunctionCallee VmExec = M->getOrInsertFunction("VMExecute", ExecFnTy);
 
   // Declare: void VMSaveReg(ptr, ptr, ..., ptr)  — 8 register values
@@ -931,9 +990,32 @@ static void insertVmpcall(Function *F) {
 
   B.CreateCall(VmSave, RegArgs);
 
-  // 2) VMExecute(bytecode_ptr, size, nregs)
+  // 2a) Build global variable address table (if any globals referenced)
+  Value *GlobalInit = Constant::getNullValue(Int8PtrTy);
+  Constant *NumGlobals = ConstantInt::get(Int32Ty, 0);
+  if (!Globals.empty()) {
+    NumGlobals = ConstantInt::get(Int32Ty, Globals.size());
+    // Format: flat array of {reg_index, value} pairs.
+    auto *GITy = ArrayType::get(IntPtrTy, Globals.size() * 2);
+    AllocaInst *GIArr = B.CreateAlloca(GITy);
+    for (size_t i = 0; i < Globals.size(); i++) {
+      Value *Addr = B.CreatePtrToInt(Globals[i].GV, IntPtrTy);
+      // Store register index
+      Value *RegGEP = B.CreateInBoundsGEP(GITy, GIArr,
+          {ConstantInt::get(Int32Ty, 0), ConstantInt::get(Int32Ty, (uint32_t)(i * 2))});
+      B.CreateStore(ConstantInt::get(IntPtrTy, Globals[i].Reg), RegGEP);
+      // Store address value
+      Value *ValGEP = B.CreateInBoundsGEP(GITy, GIArr,
+          {ConstantInt::get(Int32Ty, 0), ConstantInt::get(Int32Ty, (uint32_t)(i * 2 + 1))});
+      B.CreateStore(Addr, ValGEP);
+    }
+    GlobalInit = B.CreateBitCast(GIArr, Int8PtrTy);
+  }
+
+  // 2b) VMExecute(bytecode_ptr, size, nregs, func_table, func_count, global_init, num_globals)
   Constant *NRegs = ConstantInt::get(Int32Ty, MaxRegs);
-  CallInst *Result = B.CreateCall(VmExec, {BCPtr, Size, NRegs, FnTableGV, FuncCountC});
+  CallInst *Result = B.CreateCall(VmExec,
+      {BCPtr, Size, NRegs, FnTableGV, FuncCountC, GlobalInit, NumGlobals});
 
   // 3) Cast and return
   if (RetTy->isVoidTy()) {
