@@ -37,7 +37,7 @@ typedef struct {
     double     ret_fp;            // float/double return value
 } VMContext;
 
-// ---- helper: resolve src2 (register or immediate) — returns 0 on success ----
+// ---- helper: resolve src2 (register or immediate) �?returns 0 on success ----
 static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t pc, uintptr_t *val) {
     if (flg & VM_FLAG_IMM) { *val = src2; return 0; }
     if (src2 >= ctx->nregs) {
@@ -60,6 +60,7 @@ typedef double (*DblRetCallFn)(void*, void*, void*, void*,
 typedef double (*FPVMCallFn)(double, double, double, double,
                              double, double, double, double);
 
+#define ARGS8(a)  a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]
 // Assembly trampoline for mixed int/fp arguments
 struct vmcall_result {
     uintptr_t int_ret;
@@ -371,10 +372,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             } else if (flg & VM_CALL_ARG_FP) {
                 // ── Pure fp args: use FPVMCallFn (case 3-4) ──
                 FPVMCallFn fn = (FPVMCallFn)func;
-                double r = fn(ctx.call_args_fp[0], ctx.call_args_fp[1],
-                              ctx.call_args_fp[2], ctx.call_args_fp[3],
-                              ctx.call_args_fp[4], ctx.call_args_fp[5],
-                              ctx.call_args_fp[6], ctx.call_args_fp[7]);
+                double r = fn(ARGS8(ctx.call_args_fp));
                 if (dst) {
                     if (flg & VM_CALL_RET_FP)
                         memcpy(&ctx.r[dst], &r, 8);
@@ -386,18 +384,12 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
                 if (flg & VM_CALL_RET_FP) {
                     // Case 2: int args + fp ret → DblRetCallFn (reads XMM0)
                     DblRetCallFn fn = (DblRetCallFn)func;
-                    double r = fn(ctx.call_args[0], ctx.call_args[1],
-                                  ctx.call_args[2], ctx.call_args[3],
-                                  ctx.call_args[4], ctx.call_args[5],
-                                  ctx.call_args[6], ctx.call_args[7]);
+                    double r = fn(ARGS8(ctx.call_args));
                     if (dst) memcpy(&ctx.r[dst], &r, 8);
                 } else {
                     // Case 1: int args + int ret → VMCallFn (reads RAX)
                     VMCallFn fn = (VMCallFn)func;
-                    void *r = fn(ctx.call_args[0], ctx.call_args[1],
-                                 ctx.call_args[2], ctx.call_args[3],
-                                 ctx.call_args[4], ctx.call_args[5],
-                                 ctx.call_args[6], ctx.call_args[7]);
+                    void *r = fn(ARGS8(ctx.call_args));
                     if (dst) ctx.r[dst] = (uintptr_t)r;
                 }
             }
