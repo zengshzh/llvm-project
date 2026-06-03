@@ -431,6 +431,13 @@ void test(Results *r) {
 
 生成的字节码中，`teststr` 被分配全局寄存器 rN，`testint` 被分配 rN+1。`strlen` 的参数通过 `SETARG r0, rN` 传入，`load i32, i32* @testint` 通过 `LOAD.4 rdst, r(N+1)` 执行。
 
+## 未支持的特性
+- 混合参数模式只在windows上跑测过，其他平台待验证
+- 开启优化(-O3)以后，会报错
+```
+/usr/bin/x86_64-linux-gnu-ld.bfd: /tmp/test-04ccf1.o:(.data.rel.ro+0x0): undefined reference to `llvm.lifetime.start.p0'
+/usr/bin/x86_64-linux-gnu-ld.bfd: /tmp/test-04ccf1.o:(.data.rel.ro+0x8): undefined reference to `llvm.lifetime.end.p0'
+```
 
 ## Example
 
