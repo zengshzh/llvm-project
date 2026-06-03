@@ -24,6 +24,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/Debug.h"
 #include <vector>
@@ -318,38 +319,33 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         } else {
           RVal = Regs.consume(ValOp);
         }
-        uint8_t SFlags = (DL.getTypeStoreSize(ValOp->getType()) > 4) ? 1 : 0;
-        if (ValOp->getType()->isFloatTy()) SFlags |= VM_FLAG_FLOAT;
+        unsigned StoreSize = DL.getTypeStoreSize(ValOp->getType());
+        uint8_t SFlags = (StoreSize - 1) & 0x0F;        // bits 0-3: size-1
 
-        if (isa<AllocaInst>(getUnderlyingObject(PtrOp))) {
-          unsigned RAddr = Regs.lookupReg(PtrOp);
-          emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
-        } else {
-          unsigned RAddr = Regs.consume(PtrOp);
-          emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags | 2);
-        }
+        // All addresses are real pointers after ALLOCA simplification.
+        unsigned RAddr = Regs.consume(PtrOp);
+        emitInsn(BC, VM_STORE, RAddr, RVal, 0, SFlags);
       } else if (auto *LI = dyn_cast<LoadInst>(&I)) {
         Value *PtrOp = LI->getPointerOperand();
         unsigned RDst = Regs.alloc(&I);
-        uint8_t LFlags = (DL.getTypeStoreSize(LI->getType()) > 4) ? 1 : 0;
+        unsigned LoadSize = DL.getTypeStoreSize(LI->getType());
+        uint8_t LFlags = (LoadSize - 1) & 0x0F;        // bits 0-3: size-1
+        // Float loads set bit 3 to prevent LOAD from sign-extending.
         if (LI->getType()->isFloatTy()) LFlags |= VM_FLAG_FLOAT;
 
-        if (isa<AllocaInst>(getUnderlyingObject(PtrOp))) {
-          unsigned RAddr = Regs.lookupReg(PtrOp);
-          emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
-        } else {
-          unsigned RAddr = Regs.consume(PtrOp);
-          emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags | 2);
-        }
+        // All addresses are real pointers after ALLOCA simplification.
+        unsigned RAddr = Regs.consume(PtrOp);
+        emitInsn(BC, VM_LOAD, RDst, RAddr, 0, LFlags);
       } else if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
         // GEP: compute pointer = base + byte_offset
         Value *PtrOp = GEP->getPointerOperand();
         APInt Offset(DL.getPointerSizeInBits(), 0);
-        unsigned RBase = Regs.consume(PtrOp);
+        unsigned RBase = Regs.lookupReg(PtrOp);
         if (GEP->accumulateConstantOffset(DL, Offset)) {
           if (Offset == 0) {
             // Zero offset → alias to base register (no bytecode emitted)
             Regs.aliasValue(&I, PtrOp);
+            Regs.consume(PtrOp);
           } else {
             // Non-zero offset: rdst = rbase + #offset
             // Uses ADD with VM_FLAG_IMM — no separate LI needed, eliminating
@@ -358,9 +354,52 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
             emitInsn(BC, VM_ADD, RDst, RBase,
                      static_cast<uint16_t>(Offset.getZExtValue()),
                      VM_FLAG_IMM);
+            Regs.consume(PtrOp);
           }
         } else {
-          LLVM_DEBUG(dbgs() << "[VMCodeGen] unsupported variable-offset GEP\n");
+          // Variable-offset GEP: assemble pointer = base + sum(idx_i * elem_size_i)
+          // Supports arr[i] patterns where one or more indices are runtime values.
+          unsigned RDst = Regs.alloc(&I);
+	  unsigned RAcc = Regs.allocRaw();
+          // Capture base into RAcc BEFORE consuming PtrOp, so register recycling
+          // (PtrOp → FreeList → another IR value) can't overwrite the base value
+          // before we've saved it.  consume(PtrOp) follows so use-count stays correct.
+          emitInsn(BC, VM_MOV, RAcc, RBase, 0);
+          Regs.consume(PtrOp);
+
+          gep_type_iterator GTI = gep_type_begin(GEP);
+          for (unsigned IdxNo = 1; IdxNo < GEP->getNumOperands(); ++IdxNo, ++GTI) {
+            Value *Idx = GEP->getOperand(IdxNo);
+	    uint64_t ElemSize = DL.getTypeAllocSize(GTI.getIndexedType());
+
+            if (auto *CI = dyn_cast<ConstantInt>(Idx)) {
+              uint64_t Off = CI->getZExtValue() * ElemSize;
+              if (Off == 0) continue;
+              if (Off <= 0xFFFF) {
+                emitInsn(BC, VM_ADD, RAcc, RAcc,
+                         static_cast<uint16_t>(Off), VM_FLAG_IMM);
+              } else {
+                unsigned RTmp = Regs.allocRaw();
+                emitInsn32(BC, VM_LI32, RTmp, static_cast<uint32_t>(Off));
+                emitInsn(BC, VM_ADD, RAcc, RAcc, RTmp, 0);
+                Regs.freeReg(RTmp);
+              }
+            } else {
+              unsigned RIdx = Regs.consume(Idx);
+              if (ElemSize == 1) {
+                emitInsn(BC, VM_ADD, RAcc, RAcc, RIdx, 0);
+              } else if (ElemSize <= 0xFFFF) {
+                unsigned RTmp = Regs.allocRaw();
+                emitInsn(BC, VM_LI, RTmp, 0, static_cast<uint16_t>(ElemSize));
+                emitInsn(BC, VM_MUL, RTmp, RIdx, RTmp, 0);
+                emitInsn(BC, VM_ADD, RAcc, RAcc, RTmp, 0);
+                Regs.freeReg(RTmp);
+              }
+            }
+          }
+
+          emitInsn(BC, VM_MOV, RDst, RAcc, 0);
+          Regs.freeReg(RAcc);
         }
       } else if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
         // Resolve src1: handle int/float constants
@@ -529,6 +568,13 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           emitInsn(BC, VM_FPTOUI, RDst, RSrc, 0, CF);
           break;
         }
+        case Instruction::PtrToInt:
+        case Instruction::IntToPtr:
+        case Instruction::BitCast:
+          // All are no-ops in the VM → pointers, ints, and bit patterns are all
+          // stored as uintptr_t in registers. Just copy the register value.
+          emitInsn(BC, VM_MOV, RDst, RSrc, 0);
+          break;
         default:
           report_fatal_error(
               Twine("[VMCodeGen] unsupported cast: ") +
@@ -540,20 +586,20 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         unsigned RDst = Regs.alloc(&I);
         // Pre-allocate constant temps BEFORE consuming, so they can't
         // conflict with freed registers (consume → allocRaw reuse bug).
-        bool S1C = isa<ConstantInt>(IC->getOperand(0));
-        bool S2C = isa<ConstantInt>(IC->getOperand(1));
+        bool S1C = isa<ConstantInt>(IC->getOperand(0)) || isa<ConstantPointerNull>(IC->getOperand(0));
+        bool S2C = isa<ConstantInt>(IC->getOperand(1)) || isa<ConstantPointerNull>(IC->getOperand(1));
         unsigned RSrc1 = S1C ? Regs.allocRaw() : 0;
         unsigned RSrc2 = S2C ? Regs.allocRaw() : 0;
-        // Now consume (may free registers) / assign non-constant operands
         if (!S1C) RSrc1 = Regs.consume(IC->getOperand(0));
         if (!S2C) RSrc2 = Regs.consume(IC->getOperand(1));
-        // Emit LI for constants
         if (S1C)
           emitInsn(BC, VM_LI, RSrc1, 0,
-                   static_cast<uint16_t>(cast<ConstantInt>(IC->getOperand(0))->getZExtValue()));
+                   static_cast<uint16_t>(isa<ConstantPointerNull>(IC->getOperand(0)) ? 0
+                     : cast<ConstantInt>(IC->getOperand(0))->getZExtValue()));
         if (S2C)
           emitInsn(BC, VM_LI, RSrc2, 0,
-                   static_cast<uint16_t>(cast<ConstantInt>(IC->getOperand(1))->getZExtValue()));
+                   static_cast<uint16_t>(isa<ConstantPointerNull>(IC->getOperand(1)) ? 0
+                     : cast<ConstantInt>(IC->getOperand(1))->getZExtValue()));
         uint8_t PredEnc = mapICmpPred(IC->getPredicate());
         emitInsn(BC, VM_CMP, RDst, RSrc1, RSrc2, PredEnc);
         if (S1C) Regs.freeReg(RSrc1);
@@ -652,6 +698,54 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
               Patches.push_back({JmpStart, FalseTarget, false});
             }
           }
+        }
+      } else if (isa<SwitchInst>(&I)) {
+        auto *SW = cast<SwitchInst>(&I);
+        Value *Cond = SW->getCondition();
+        unsigned RCond = Regs.consume(Cond);
+        BasicBlock *DefaultBB = SW->getDefaultDest();
+
+        // PHI lowering for each successor (including default)
+        auto lowerPhi = [&](BasicBlock *Succ) {
+          for (auto &SI : *Succ) {
+            auto *PN = dyn_cast<PHINode>(&SI);
+            if (!PN) break;
+            Value *Incoming = PN->getIncomingValueForBlock(&BB);
+            unsigned RPhi = Regs.lookupReg(PN);
+            if (auto *CI = dyn_cast<ConstantInt>(Incoming)) {
+              emitInsn(BC, VM_LI, RPhi, 0, static_cast<uint16_t>(CI->getZExtValue()));
+            } else {
+              unsigned RVal = Regs.consume(Incoming);
+              emitInsn(BC, VM_MOV, RPhi, RVal, 0);
+            }
+          }
+        };
+
+        // Emit CMP + BR for each case: compare Cond == case_val, jump on EQ
+        for (auto &C : SW->cases()) {
+          ConstantInt *CV = C.getCaseValue();
+          unsigned RVal = Regs.allocRaw();
+          emitInsn(BC, VM_LI, RVal, 0, static_cast<uint16_t>(CV->getZExtValue()));
+          unsigned RCmp = Regs.allocRaw();
+          emitInsn(BC, VM_CMP, RCmp, RCond, RVal, 0);  // pred=0 = EQ
+          Regs.freeReg(RVal);
+          Regs.freeReg(RCmp);
+          // Allocate RCmp before consume so it doesn't collide
+
+          BasicBlock *Target = C.getCaseSuccessor();
+          lowerPhi(Target);
+
+          unsigned BrStart = BC.size();
+          emitInsn(BC, VM_BR, 0, RCmp, 0);
+          Patches.push_back({BrStart, Target, true});
+        }
+
+        // Default: jump to default BB
+        lowerPhi(DefaultBB);
+        if (BBOrder[DefaultBB] != BBOrder[&BB] + 1) {
+          unsigned JmpStart = BC.size();
+          emitInsn(BC, VM_JMP, 0, 0, 0);
+          Patches.push_back({JmpStart, DefaultBB, false});
         }
       } else if (auto *CI = dyn_cast<CallInst>(&I)) {
         Function *Callee = CI->getCalledFunction();

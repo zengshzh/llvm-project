@@ -63,7 +63,8 @@ enum VM_Opcode {
 
 // Flags
 #define VM_FLAG_IMM   4   // bit 2: src2 是 16 位立即数（用于算术/逻辑运算）
-#define VM_FLAG_FLOAT 8   // bit 3: 浮点类型（LOAD/STORE 不符号扩展）
+#define VM_FLAG_FLOAT 8   // bit 3: 通用浮点标志（类型转换双精度等）
+#define VM_FLAG_SEXT  0x10 // bit 4: LOAD/STORE 符号扩展（否则零扩展）
 #define VM_FLAG_BR_NT 1   // bit 0: BR 条件取反（条件为 0 时跳转）
 
 // CALL 标志位（与通用 flags 共用字节）
@@ -74,6 +75,10 @@ enum VM_Opcode {
 void print_insn(const uint8_t *bc, uint32_t off);
 void hexdump(const uint8_t *bc, uint32_t size);
 void print_reg_result(unsigned reg, uintptr_t val);
+void print_vm_header(uint32_t size, uint32_t nregs);
+void print_vmsave(const uintptr_t gpr[8]);
+void print_store_mem(uintptr_t addr, uintptr_t val);
+void print_vm_ret(uintptr_t val);
 void *VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs,
                 void (**func_table)(void), uint32_t func_count);
 void VMSaveReg(void *r0, void *r1, void *r2, void *r3,

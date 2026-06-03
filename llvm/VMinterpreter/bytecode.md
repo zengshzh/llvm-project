@@ -11,26 +11,12 @@
 | Offset | Size | Field  | Description            |
 |--------|------|--------|------------------------|
 | 0      | 1    | opcode | 指令操作码              |
-| 1      | 1    | flags  | 标志位（见 Flags 定义） |
+| 1      | 1    | flags  | 标志位（见各指令的 flags 说明） |
 | 2-3    | 2    | dst    | 目标寄存器编号           |
 | 4-5    | 2    | src1   | 源操作数 1              |
 | 6-7    | 2    | src2   | 源操作数 2 / 立即数      |
 
-## Flags
-
-| Bit | 用途     | 说明                                       |
-|-----|----------|-------------------------------------------|
-| 0   | 访问宽度 / BR 条件取反 | 0 = 4 字节（LOAD/STORE），1 = `sizeof(uintptr_t)` 字节（LOAD/STORE）；BR 专用：1 = 条件取反（rcond == 0 时跳转） |
-| 1   | 内存空间 | 0 = VM 内部内存，1 = 原生内存（外部指针） |
-| 2   | 立即数   | 0 = src2 为寄存器，1 = src2 为 16 位立即数（算术/逻辑运算专用） |
-| 3   | 浮点类型 | 0 = 整数，1 = 浮点（仅 LOAD: 不符号扩展保持位模式） |
-| 4-7 | 保留     | 当前为 0                                  |
-
-> **CMP** 指令特殊：flags 低 4 位（bits 0–3）编码比较谓词（0=EQ … 9=SLE），不适用上述通用标志位定义。
-
-LOAD 和 STORE 使用 bit 0 + bit 1，ALLOCA 使用 bit 0 区分立即数/寄存器大小。
-算术/逻辑运算使用 **bit 2** 指示 src2 是 16 位立即数还是寄存器索引。
-LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制位模式）。
+> **注意：** flags 字节的每个 bit 含义**因指令而异**。例如 bit 0 在 LOAD/STORE 中表示宽度，在 BR 中表示条件取反，在算术指令中无意义。以下各指令详情中均有 flags 说明。
 
 ## Register Model
 
@@ -38,6 +24,7 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 - **r8+**: 通用虚拟寄存器，由 bytecode 生成器动态分配和回收
 
 > 寄存器值宽度为 `uintptr_t`（32 位平台 4 字节，64 位平台 8 字节）。
+> ALLOCA 返回真实内存地址（`ctx.m + 偏移`），LOAD/STORE 统一通过真实地址访问内存。
 > 编码字段 16 位（支持 0–65535）。
 
 ### 动态寄存器分配算法
@@ -77,55 +64,56 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 
 **GEP 非零偏移**使用 `ADD rdst, rbase, #imm` 单指令（`VM_FLAG_IMM`），不经过 LI 临时寄存器，消除 `rbase` 与临时寄存器碰撞的风险。
 
+**变量偏移 GEP**（如 `arr[i]`，其中 i 为运行时的值）：
+1. 扫描 GEP 的每个索引，对每个索引计算 `idx * elem_size`
+   - 常量索引：直接发射 `ADD rdst, rbase, #offset`（`VM_FLAG_IMM`）
+   - 变量索引：`elem_size == 1` 时发射 `ADD rdst, rbase, ridx`；`elem_size <= 0xFFFF` 时先 `LI tmp, #size` + `MUL tmp, ridx, tmp` 再 `ADD rdst, rdst, tmp`
+2. 依次累加各维度的偏移量到临时累加器寄存器
+3. 最后将累加器写入 GEP 目标寄存器
+
+示例：`input[i]`（`getelementptr i8, i8* %input, i64 %i`）翻译为：
+```
+ADD  rtmp, r_input, r_i    ; rtmp = input + i * 1
+```
+
 **Phi 节点**的寄存器永不进入 FreeList，确保循环穿越的值在多轮迭代中不被回收。
 
 ## Opcode Table
 
-| Opcode | Mnemonic | Format                  | Description                          |
-|--------|----------|-------------------------|--------------------------------------|
+| Opcode | Mnemonic | Format & flags           | Description                          |
+|--------|----------|--------------------------|--------------------------------------|
 |        | **内存** (0x00–0x0F) | | |
-| 0x00   | ALLOCA   | `ALLOCA rdst, #size`    | 在 VM 栈上分配 `size` 字节，返回栈顶地址 |
-| 0x01   | LOAD     | `LOAD rdst, raddr`      | 从 `raddr` 指向的地址加载 4/8 字节      |
-| 0x02   | STORE    | `STORE rval, raddr`     | 将 `rval` 的值存入 `raddr` 指向的地址 |
-| 0x03   | LI       | `LI rdst, #imm`         | 加载 16 位立即数到目标寄存器           |
-| 0x04   | LI32     | `LI32 rdst, #imm32`     | 加载 32 位立即数到目标寄存器           |
-| 0x05   | MOV      | `MOV rdst, rsrc`        | rdst = rsrc (寄存器复制)              |
-| 0x06   | CMP      | `CMP rdst, rsrc1, rsrc2`| 整数比较，谓词在 flags 低 4 位，结果 0/1 写入 rdst |
-| 0x07   | FCMP     | `FCMP rdst, rsrc1, rsrc2`| 浮点比较，谓词在 flags 低 4 位，bit4=1 为 double |
-| 0x08   | JMP      | `JMP #offset`           | 无条件跳转，offset 为有符号 16 位相对偏移 |
-| 0x09   | BR       | `BR rcond, #offset`     | 条件跳转，rcond ≠ 0 时跳转 offset 字节 |
+| 0x00   | ALLOCA   | `ALLOCA rdst, #size`     | flags bit0=0: src2 为立即数大小，bit0=1: src1 为存放大小的寄存器 |
+| 0x01   | LOAD     | `LOAD rdst, raddr`       | bits0-3=size-1(0→1B…15→16B)，零扩展到 uintptr_t。例: LOAD.1=1B, LOAD.4=4B |
+| 0x02   | STORE    | `STORE rval, raddr`      | bits0-3=size-1(同LOAD); bit4忽略 |
+| 0x03   | LI       | `LI rdst, #imm`          | 加载 16 位立即数到目标寄存器，flags 不适用 |
+| 0x04   | LI32     | `LI32 rdst, #imm32`      | src1\|(src2<<16) → rdst，flags 不适用 |
+| 0x05   | MOV      | `MOV rdst, rsrc`         | rdst = rsrc，flags 不适用            |
+| 0x06   | CMP      | `CMP rdst, rsrc1, rsrc2` | flags 低4位编码比较谓词(0=EQ…9=SLE)，结果0/1写入rdst |
+| 0x07   | FCMP     | `FCMP rdst, rsrc1, rsrc2`| flags 低4位编码比较谓词；bit4=1→double, 0→float |
+| 0x08   | JMP      | `JMP #offset`            | pc += (int16_t)src1，flags 不适用    |
+| 0x09   | BR       | `BR rcond, #offset`      | rcond≠0 时跳转；bit0=1 → 条件取反(rcond==0跳) |
 |        | **函数调用** (0x0A-0x0B) | | |
-| 0x0A   | SETARG   | `SETARG slot, rsrc`     | 设置调用参数槽。flags bit0=1 浮点→`call_args_fp`，否则→`call_args` |
-| 0x0B   | CALL     | `CALL rdst, [func_idx]` | 调用 `func_table[src1]`。flags bit0=1 读 XMM0 返回，否则读 RAX |
+| 0x0A   | SETARG   | `SETARG slot, rsrc`      | bit0=1→浮点写入`call_args_fp`, 0→整数写入`call_args` |
+| 0x0B   | CALL     | `CALL rdst, [func_idx]`  | bit0=1→读XMM0返回(浮点), 0→读RAX；bit1=1→全浮点参数；bit2=1→混合参数 |
 |        | **整数算术** (0x10–0x1F) | | |
-| 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2 (整数加法)        |
-| 0x11   | SUB      | `SUB rdst, rsrc1, rsrc2`| rdst = rsrc1 - rsrc2 (整数减法)        |
-| 0x12   | MUL      | `MUL rdst, rsrc1, rsrc2`| rdst = rsrc1 * rsrc2 (整数乘法)        |
-| 0x13   | UDIV     | `UDIV rdst, rsrc1, rsrc2`| rdst = rsrc1 / rsrc2 (无符号整数除法)  |
-| 0x14   | SDIV     | `SDIV rdst, rsrc1, rsrc2`| rdst = rsrc1 / rsrc2 (有符号整数除法)  |
-| 0x15   | UREM     | `UREM rdst, rsrc1, rsrc2`| rdst = rsrc1 % rsrc2 (无符号取余)      |
-| 0x16   | SREM     | `SREM rdst, rsrc1, rsrc2`| rdst = rsrc1 % rsrc2 (有符号取余)      |
-| 0x17   | SHL      | `SHL rdst, rsrc1, rsrc2` | rdst = rsrc1 << rsrc2 (左移)          |
-| 0x18   | LSHR     | `LSHR rdst, rsrc1, rsrc2`| rdst = rsrc1 >> rsrc2 (逻辑右移)      |
-| 0x19   | ASHR     | `ASHR rdst, rsrc1, rsrc2`| rdst = rsrc1 >> rsrc2 (算术右移)      |
-| 0x1A   | AND      | `AND rdst, rsrc1, rsrc2` | rdst = rsrc1 & rsrc2 (按位与)         |
-| 0x1B   | OR       | `OR rdst, rsrc1, rsrc2`  | rdst = rsrc1 \| rsrc2 (按位或)        |
-| 0x1C   | XOR      | `XOR rdst, rsrc1, rsrc2` | rdst = rsrc1 ^ rsrc2 (按位异或)       |
+| 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2` | bit2=1 → src2 为16位立即数，0 → src2 为寄存器 |
+| 0x11–0x1C | SUB … XOR | (同 ADD) | 所有整数算术指令复用相同的 flags 编码：bit2=1 为立即数模式 |
 |        | **浮点算术** (0x20–0x2F) | | |
-| 0x20   | FADD     | `FADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2 (浮点加, bit0=1 → double) |
-| 0x21   | FSUB     | `FSUB rdst, rsrc1, rsrc2`| rdst = rsrc1 - rsrc2 (浮点减, bit0=1 → double) |
-| 0x22   | FMUL     | `FMUL rdst, rsrc1, rsrc2`| rdst = rsrc1 * rsrc2 (浮点乘, bit0=1 → double) |
-| 0x23   | FDIV     | `FDIV rdst, rsrc1, rsrc2`| rdst = rsrc1 / rsrc2 (浮点除, bit0=1 → double) |
+| 0x20   | FADD     | `FADD rdst, rsrc1, rsrc2`| bit0=1→double, 0→float；bit2=1→src2为立即数 |
+| 0x21–0x23 | FSUB … FDIV | (同 FADD) | 浮点算术复用相同 flags |
 |        | **类型转换** (0x30–0x3F) | | |
-| 0x30   | SITOFP   | `SITOFP rdst, rsrc`     | int32→float/double (bit0=1 → double) |
-| 0x31   | FPTOSI   | `FPTOSI rdst, rsrc`     | float/double→int32 (bit0=1 → double) |
-| 0x32   | FPTRUNC  | `FPTRUNC rdst, rsrc`    | double→float 截断                     |
-| 0x33   | FPEXT    | `FPEXT rdst, rsrc`      | float→double 扩展                     |
-| 0x34   | SEXT     | `SEXT rdst, rsrc`       | 符号扩展 i32→intptr                  |
-| 0x35   | ZEXT     | `ZEXT rdst, rsrc`       | 零扩展 i32→uintptr                   |
-| 0x36   | TRUNC    | `TRUNC rdst, rsrc`      | 截断至 i32（清空高 32 位）           |
+| 0x30   | SITOFP   | `SITOFP rdst, rsrc`      | bit0=1→double, 0→float              |
+| 0x31   | FPTOSI   | `FPTOSI rdst, rsrc`      | bit0=1→double输入, 0→float输入      |
+| 0x32   | FPTRUNC  | `FPTRUNC rdst, rsrc`     | double→float，flags 不适用           |
+| 0x33   | FPEXT    | `FPEXT rdst, rsrc`       | float→double，flags 不适用           |
+| 0x34   | SEXT     | `SEXT rdst, rsrc`        | 符号扩展 i32→intptr，flags 不适用    |
+| 0x35   | ZEXT     | `ZEXT rdst, rsrc`        | 零扩展 i32→uintptr，flags 不适用    |
+| 0x36   | TRUNC    | `TRUNC rdst, rsrc`       | 截断至 i32，flags 不适用             |
+| 0x37   | UITOFP   | `UITOFP rdst, rsrc`      | uint→float/double, bit0=1→double    |
+| 0x38   | FPTOUI   | `FPTOUI rdst, rsrc`      | float/double→uint, bit0=1→double输入|
 |        | **特殊** | | |
-| 0xFF   | RET      | `RET rval`              | 返回 `rval` 中的值                   |
+| 0xFF   | RET      | `RET rval`               | 返回 rval，flags 不适用              |
 
 ### Instruction Details
 
@@ -139,16 +127,16 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 
 **LOAD** (0x01)
 - 编码: `[0x01][flags(1)][dst(2)][raddr(2)][0]`
-- 从 `raddr` 指向的地址读取数据，存入 `rdst`
-- **flags bit 0**: 0 = 读取 4 字节，1 = 读取 `sizeof(uintptr_t)` 字节
-- **flags bit 1**: 0 = 从 VM 内部内存读取（`raddr` 为 ALLOCA 偏移量），1 = 从原生内存读取（`raddr` 为外部指针）
+- 从 `raddr` 指向的真实地址读取数据，存入 `rdst`
+- **bits 0-3**: `size = (flags & 0x0F) + 1`，取值范围 1–16 字节。超过 `sizeof(uintptr_t)` 时截断。
+- 宽度 1/2 字节：**零扩展**到 `uintptr_t`。宽度 4 字节：**符号扩展** int32→intptr（对 float 零扩展）。
+- 示例：`LOAD.1`=1 字节零扩展，`LOAD.4`=4 字节符号扩展
 
 **STORE** (0x02)
 - 编码: `[0x02][flags(1)][raddr(2)][rval(2)][0]`
-- 将 `rval` 的值写入 `raddr` 指向的地址
+- 将 `rval` 的值的低 N 字节写入 `raddr` 指向的真实地址
 - 注意: dst 字段在此指令中表示地址，src1 表示值
-- **flags bit 0**: 0 = 写入 4 字节，1 = 写入 `sizeof(uintptr_t)` 字节
-- **flags bit 1**: 0 = 写入 VM 内部内存，1 = 写入原生内存
+- **bits 0-3**: `size = (flags & 0x0F) + 1`，同 LOAD。bit 4 忽略。
 
 **MOV** (0x05)
 - 编码: `[0x05][0][dst(2)][src(2)][0]`
@@ -320,42 +308,26 @@ C 调用:
 | LLVM IR         | VM Bytecode   |
 |-----------------|---------------|
 | `alloca i32`    | `ALLOCA rdst, #size` |
-| `load i32, ptr` | `LOAD rdst, raddr` (flags bit 0 = 0) |
-| `load float, ptr` | `LOAD rdst, raddr` (flags bit 3 = 1, 不符号扩展) |
-| `load ptr, ptr` | `LOAD.nat rdst, raddr` (flags bit 1 = 1) |
+| `load i8, ptr`   | `LOAD.1 rdst, raddr` (size=1, bit4=0 零扩展) |
+| `load i32, ptr` | `LOAD.4 rdst, raddr` (size=4, bit4=1 符号扩展) |
+| `load float, ptr` | `LOAD.4 rdst, raddr` (size=4, bit4=0 直接复制) |
+| `load ptr, ptr` | `LOAD.8 rdst, raddr` (size=8 全宽复制) |
 | `store val, ptr`| `STORE rval, raddr` |
-| `add`           | `ADD rdst, rsrc1, rsrc2` |
-| `sub`           | `SUB rdst, rsrc1, rsrc2` |
-| `mul`           | `MUL rdst, rsrc1, rsrc2` |
-| `udiv`          | `UDIV rdst, rsrc1, rsrc2` |
-| `sdiv`          | `SDIV rdst, rsrc1, rsrc2` |
-| `urem`          | `UREM rdst, rsrc1, rsrc2` |
-| `srem`          | `SREM rdst, rsrc1, rsrc2` |
-| `shl`           | `SHL rdst, rsrc1, rsrc2` |
-| `lshr`          | `LSHR rdst, rsrc1, rsrc2` |
-| `ashr`          | `ASHR rdst, rsrc1, rsrc2` |
-| `and`           | `AND rdst, rsrc1, rsrc2` |
-| `or`            | `OR rdst, rsrc1, rsrc2` |
-| `xor`           | `XOR rdst, rsrc1, rsrc2` |
-| `fadd`          | `FADD rdst, rsrc1, rsrc2` |
-| `fsub`          | `FSUB rdst, rsrc1, rsrc2` |
-| `fmul`          | `FMUL rdst, rsrc1, rsrc2` |
-| `fdiv`          | `FDIV rdst, rsrc1, rsrc2` |
+| `add` / `sub` / … | `ADD` / `SUB` / … (bit2=1 则 src2 为立即数) |
+| `fadd` / …     | `FADD` / … (bit0=1→double, bit2=1→立即数) |
 | `ret val`       | `RET rval` |
-| `sitofp`        | `SITOFP rdst, rsrc` (int→float/double, flags bit0=1 for double) |
-| `fptosi`        | `FPTOSI rdst, rsrc` (float/double→int, flags bit0=1 for double) |
-| `fptrunc`       | `FPTRUNC rdst, rsrc` (double→float) |
-| `fpext`         | `FPEXT rdst, rsrc` (float→double) |
-| `sext`          | `SEXT rdst, rsrc` (i32→intptr 符号扩展) |
-| `zext`          | `ZEXT rdst, rsrc` (i32→uintptr 零扩展) |
-| `trunc`         | `TRUNC rdst, rsrc` (intptr→i32 截断) |
+| `sitofp` / `fptosi` / `uitofp` / `fptoui` | 对应指令 (bit0=1→double) |
+| `fptrunc` / `fpext` / `sext` / `zext` / `trunc` | 对应指令，flags 不适用 |
+| `ptrtoint` / `inttoptr` / `bitcast` | `MOV rdst, rsrc`（VM 中寄存器不变，无操作） |
 | `const int`     | `LI rdst, #imm` |
-| `const float`   | `LI32 rdst, #imm32` (加载浮点位模式) |
-| `icmp eq/ne/...`| `CMP rdst, rsrc1, rsrc2` (predicate 编码在 flags 低 4 位) |
-| `fcmp oeq/olt/...` | `FCMP rdst, rsrc1, rsrc2` (predicate 编码同 CMP，bit4=1 为 double) |
+| `const float`   | `LI32 rdst, #imm32` |
+| `icmp`          | `CMP rdst, rsrc1, rsrc2` (pred 编码在 flags 低4位) |
+| `fcmp`          | `FCMP rdst, rsrc1, rsrc2` (pred 同 CMP, bit4=1→double) |
 | `br label`      | `JMP #offset` |
 | `br i1 cond, label, label` | `BR rcond, #offset` (true → BR, false → JMP，相邻目标时优化 JMP)` |
 | `phi`           | 降级为 `MOV` 指令，在前驱块末尾插入，当前块跳过生成 |
+| `switch val, default, [c1→bb1, ...]` | `LI #c; CMP; BR` 链 + phi 降级 |
+| `getelementptr` | 常量偏移 → `ADD rdst, rbase, #imm` (`VM_FLAG_IMM`)；变量偏移 → `MOV rtmp, rbase` + `ADD rtmp, rtmp, ridx`(×elem_size) + `MOV rdst, rtmp` |
 
 **总进度： 9/10 类指令已支持（`█████████░`）**
 
@@ -370,7 +342,7 @@ C 调用:
 | 浮点算术 | ✅ ✅ ✅ ✅ ❌ | fadd, fsub, fmul, fdiv 使用专用浮点 ALU；frem 暂不支持 |
 | 控制流 | ✅ ✅ ❌ ❌ ❌ | br (无条件/条件), phi (MOV 降级) ✅ / switch, select, indirectbr 等 ✗ |
 | 比较 | ✅ ✅ | icmp, fcmp |
-| 类型转换 | ✅ ✅ ✅ ✅ ✅ ✅ ✅ ❌ ❌ | sitofp, fptosi, fptrunc, fpext, sext, zext, trunc ✓ / uitofp, fptoui ✗ |
+| 类型转换 | ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ | sitofp, fptosi, fptrunc, fpext, sext, zext, trunc, uitofp, fptoui 全部支持 |
 | 聚合操作 | ❌ ❌ ❌ ❌ ❌ | extractvalue, insertvalue, 向量操作 |
 | 函数调用 | ✅ ✅ | call (SETARG+CALL 汇编跳板，支持整数/浮点参数及返回值) |
 
@@ -378,26 +350,18 @@ C 调用:
 
 当前 `VMCodeGen.cpp` 遇到以下指令会触发 `report_fatal_error` 直接终止编译。
 
-### 控制流 — 中优先级
+### 控制流
 
 | IR 指令 | 说明 | 依赖 |
 |---------|------|------|
-| `switch` | 多路分支 | 需要 br 支持 |
-| `select` | 条件选择 | 需要比较指令 |
+| `select` | 条件选择 | 待实现 |
 | `indirectbr` | 间接跳转 | 较少见 |
 | `invoke` / `resume` / `landingpad` | 异常处理 | 复杂，暂不考虑 |
 
-### 类型转换 — 中优先级
+### 类型转换
 
 | IR 指令 | 说明 |
 |---------|------|
-| `trunc` | ❌ 整数截断 |
-| `zext` | ❌ 零扩展 |
-| `sext` | ❌ 符号扩展 |
-| `ptrtoint` | ❌ 指针转整数 |
-| `inttoptr` | ❌ 整数转指针 |
-| `bitcast` | ❌ 位模式重解释 |
-| `fptoui` / `uitofp` | ❌ 无符号浮点转换 |
 | `addrspacecast` | ❌ 地址空间转换 |
 
 ### 浮点运算
@@ -406,14 +370,14 @@ C 调用:
 |---------|------|
 | `frem` | ❌ 浮点取余 |
 
-### 内存内联函数 — 低优先级
+### 内存内联函数
 
 | IR 指令 | 说明 |
 |---------|------|
 | `memcpy` / `memmove` | 内存拷贝（`@llvm.memcpy.*`） |
 | `memset` | 内存设置（`@llvm.memset.*`） |
 
-### 聚合操作 — 低优先级
+### 聚合操作
 
 | IR 指令 | 说明 |
 |---------|------|
@@ -480,7 +444,7 @@ int test(int a, int b) {
   0x0098: RET    r21
 ```
 
-引用参数示例（`LOAD.nat` / `STORE.nat` 访问外部内存）：
+引用参数示例（ALLOCA 返回真实地址，LOAD/STORE 统一走原生内存）：
 ```c
 __attribute__((annotate("VMP")))
 void test(uint32_t &a, uint32_t &b) {
@@ -496,9 +460,9 @@ void test(uint32_t &a, uint32_t &b) {
   0x0010: ALLOCA r39, #4       ; c = alloca i32
   0x0018: STORE  r0, r37       ; store reference ptr a to alloca
   0x0020: STORE  r1, r38       ; store reference ptr b to alloca
-  0x0028: LOAD.nat r8, r37     ; load a value via native ptr → r8 = *a
-  0x0030: LOAD.nat r9, r38     ; load b value via native ptr → r9 = *b
+  0x0028: LOAD   r8, r37       ; r8 = *a (LOAD 统一走真实地址)
+  0x0030: LOAD   r9, r38       ; r9 = *b
   0x0038: ADD    r10, r8, r9   ; c = a + b
   ...
-  0x0050: STORE.nat r10, r37   ; *a = c (write back via native ptr)
+  0x0050: STORE  r10, r37      ; *a = c (STORE 统一走真实地址)
 ```

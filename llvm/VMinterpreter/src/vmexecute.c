@@ -19,19 +19,24 @@ void VMSaveReg(void *r0, void *r1, void *r2, void *r3,
     gpr[5] = (uintptr_t)r5;
     gpr[6] = (uintptr_t)r6;
     gpr[7] = (uintptr_t)r7;
-    printf("[VMSaveReg] r0=%p r1=%p r2=%p r3=%p "
-           "r4=%p r5=%p r6=%p r7=%p\n",
-           (void *)gpr[0], (void *)gpr[1], (void *)gpr[2], (void *)gpr[3],
-           (void *)gpr[4], (void *)gpr[5], (void *)gpr[6], (void *)gpr[7]);
+    print_vmsave(gpr);
 }
+
+// Overflow block for VLA (variable-length ALLOCA)
+typedef struct VMMemBlock {
+    struct VMMemBlock *next;
+    uint8_t           *mem;
+    size_t             size;
+} VMMemBlock;
 
 // ---- VM execution context ----
 typedef struct {
     uintptr_t *r;    // dynamically allocated, nregs elements
     uint32_t   nregs;
-    uint8_t   *m;
-    size_t     mcap;
-    uint32_t   vm_sp;
+    uint8_t   *m;           // main block: pre-allocated from bytecode scan
+    size_t     mcap;        // main block capacity
+    VMMemBlock *blocks;     // linked list of VLA overflow blocks
+    uint32_t   vm_sp;       // bump offset in main block
     void      *call_args[8];      // integer/pointer arg slots
     double     call_args_fp[8];   // float/double arg slots
     double     ret_fp;            // float/double return value
@@ -74,12 +79,29 @@ extern void vm_call_trampoline(void *func, void **int_args,
 void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
                 void (**func_table)(void), uint32_t func_count) {
     hexdump(bc, size);
-    printf("=== VM bytecode (%u bytes, %u regs) ===\n", size, nregs);
+    print_vm_header(size, nregs);
 
     VMContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.nregs = nregs;
     ctx.r = calloc(nregs, sizeof(uintptr_t));
+
+    // Pre-scan bytecode for fixed-size ALLOCAs, sum them up so we allocate
+    // exactly once — no realloc needed (it would invalidate returned pointers).
+    // VLA (variable-length) ALLOCAs fall back to separate overflow blocks.
+    {
+      size_t need = 0;
+      for (uint32_t pc = 0; pc + 8 <= size; pc += 8) {
+        if (bc[pc] == VM_ALLOCA && !(bc[pc + 1] & 1)) {
+          uint16_t sz = bc[pc + 6] | (uint16_t)bc[pc + 7] << 8;
+          need += sz;
+        }
+      }
+      if (need) {
+        ctx.mcap = need;
+        ctx.m = calloc(1, need);
+      }
+    }
 
     // Restore argument registers saved by VMSaveReg
     for (int i = 0; i < 8 && i < (int)nregs; i++)
@@ -144,53 +166,55 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
         switch (op) {
         case VM_ALLOCA: {
             uint32_t alloc_size = (flg & 1) ? (uint32_t)ctx.r[src1] : src2;
-            if (ctx.vm_sp + alloc_size > ctx.mcap) {
-                size_t newcap = ctx.mcap ? ctx.mcap * 2 : 4096;
-                while (ctx.vm_sp + alloc_size > newcap)
-                    newcap *= 2;
-                ctx.m = realloc(ctx.m, newcap);
-                memset(ctx.m + ctx.mcap, 0, newcap - ctx.mcap);
-                ctx.mcap = newcap;
+            if (flg & 1) {
+              // VLA: allocate an overflow block (can't live in main bump arena)
+              VMMemBlock *blk = calloc(1, sizeof(VMMemBlock));
+              blk->mem = calloc(1, alloc_size);
+              blk->size = alloc_size;
+              blk->next = ctx.blocks;
+              ctx.blocks = blk;
+              ctx.r[dst] = (uintptr_t)blk->mem;
+            } else {
+              if (ctx.vm_sp + alloc_size > ctx.mcap) {
+                fprintf(stderr, "[VM] ALLOCA oom at 0x%04X (need %zu, cap %zu)\n",
+                        pc, ctx.vm_sp + (size_t)alloc_size, ctx.mcap);
+                goto cleanup;
+              }
+              ctx.r[dst] = (uintptr_t)(ctx.m + ctx.vm_sp);
+              ctx.vm_sp += alloc_size;
             }
-            ctx.r[dst] = ctx.vm_sp;
-            ctx.vm_sp += alloc_size;
             print_reg_result(dst, ctx.r[dst]);
             break;
         }
         case VM_LOAD: {
-            size_t load_size = (flg & 1) ? sizeof(uintptr_t) : 4;
-            void *src_ptr;
-            if (flg & 2) {
-                uintptr_t load_addr = ctx.r[src1];
-                if (!load_addr) { fprintf(stderr, "[VM] load null at 0x%04X\n", pc); goto cleanup; }
-                src_ptr = (void *)load_addr;
-            } else {
-                uintptr_t load_addr = ctx.r[src1];
-                if (load_addr + load_size > ctx.mcap) { fprintf(stderr, "[VM] load bounds at 0x%04X\n", pc); goto cleanup; }
-                src_ptr = ctx.m + load_addr;
-            }
+            uintptr_t load_addr = ctx.r[src1];
+            if (!load_addr) { fprintf(stderr, "[VM] load null at 0x%04X\n", pc); goto cleanup; }
+            unsigned load_size = (flg & 0x0F) + 1;          // bits 0-3: size-1
+            if (load_size > sizeof(uintptr_t)) load_size = sizeof(uintptr_t);
+
+            // Zero-extend: copy bytes into zeroed temp
+            uintptr_t tmp = 0;
+            memcpy(&tmp, (void *)load_addr, load_size);
+
+            // Sign-extend for 4-byte integer loads (i32 → intptr), so that
+            // negative i32 values (e.g. higher bit set) are correctly preserved
+            // in subsequent signed arithmetic (ADD, ASHR, etc.).
             if (load_size == 4 && !(flg & VM_FLAG_FLOAT)) {
-                int32_t tmp;
-                memcpy(&tmp, src_ptr, 4);
-                ctx.r[dst] = (intptr_t)tmp;  // sign-extend int32→intptr
+                int32_t sx = (int32_t)tmp;
+                ctx.r[dst] = (uintptr_t)sx;
             } else {
-                memcpy(&ctx.r[dst], src_ptr, load_size);  // float or full-width
+                ctx.r[dst] = tmp;
             }
             print_reg_result(dst, ctx.r[dst]);
             break;
         }
         case VM_STORE: {
-            size_t store_size = (flg & 1) ? sizeof(uintptr_t) : 4;
+            unsigned store_size = (flg & 0x0F) + 1;         // bits 0-3: size-1
+            if (store_size > sizeof(uintptr_t)) store_size = sizeof(uintptr_t);
             uintptr_t store_addr = ctx.r[dst];
-            if (flg & 2) {
-                if (!store_addr) { fprintf(stderr, "[VM] store null at 0x%04X\n", pc); goto cleanup; }
-                memcpy((void *)store_addr, &ctx.r[src1], store_size);
-            } else {
-                if (store_addr + store_size > ctx.mcap) { fprintf(stderr, "[VM] store bounds at 0x%04X\n", pc); goto cleanup; }
-                memcpy(ctx.m + store_addr, &ctx.r[src1], store_size);
-            }
-            printf("  => mem[%zu] = %zu (0x%zX)\n",
-                   store_addr, ctx.r[src1], ctx.r[src1]);
+            if (!store_addr) { fprintf(stderr, "[VM] store null at 0x%04X\n", pc); goto cleanup; }
+            memcpy((void *)store_addr, &ctx.r[src1], store_size);
+            print_store_mem(store_addr, ctx.r[src1]);
             break;
         }
         case VM_LI:
@@ -418,7 +442,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             break;
         }
         case VM_RET:
-            printf("[VM] return: %zu (0x%zX)\n", ctx.r[dst], ctx.r[dst]);
+            print_vm_ret(ctx.r[dst]);
             retval = (void *)(uintptr_t)ctx.r[dst];
             goto cleanup;
         default:
@@ -429,6 +453,15 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
     }
     fprintf(stderr, "[VM] no RET found\n");
 cleanup:
+    {
+        VMMemBlock *blk = ctx.blocks;
+        while (blk) {
+            VMMemBlock *next = blk->next;
+            free(blk->mem);
+            free(blk);
+            blk = next;
+        }
+    }
     free(ctx.r);
     free(ctx.m);
     return retval;
