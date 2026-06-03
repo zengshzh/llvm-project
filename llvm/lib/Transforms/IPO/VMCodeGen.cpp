@@ -195,6 +195,29 @@ struct RegisterAllocator {
   }
 };
 
+// Map LLVM FCmpInst predicate to VM FCMP predicate encoding (flags bits 0-3)
+static uint8_t mapFCmpPred(CmpInst::Predicate Pred) {
+  switch (Pred) {
+  case CmpInst::FCMP_OEQ: return 0;
+  case CmpInst::FCMP_OGT: return 1;
+  case CmpInst::FCMP_OGE: return 2;
+  case CmpInst::FCMP_OLT: return 3;
+  case CmpInst::FCMP_OLE: return 4;
+  case CmpInst::FCMP_ONE: return 5;
+  case CmpInst::FCMP_ORD: return 6;
+  case CmpInst::FCMP_UNO: return 7;
+  case CmpInst::FCMP_UEQ: return 8;
+  case CmpInst::FCMP_UGT: return 9;
+  case CmpInst::FCMP_UGE: return 10;
+  case CmpInst::FCMP_ULT: return 11;
+  case CmpInst::FCMP_ULE: return 12;
+  case CmpInst::FCMP_UNE: return 13;
+  default:
+    report_fatal_error(Twine("[VMCodeGen] unsupported fcmp predicate: ") +
+                       Twine(Pred) + "\n");
+  }
+}
+
 // Map LLVM ICmpInst predicate to VM CMP predicate encoding (flags bits 0-3)
 static uint8_t mapICmpPred(CmpInst::Predicate Pred) {
   switch (Pred) {
@@ -533,6 +556,29 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
                    static_cast<uint16_t>(cast<ConstantInt>(IC->getOperand(1))->getZExtValue()));
         uint8_t PredEnc = mapICmpPred(IC->getPredicate());
         emitInsn(BC, VM_CMP, RDst, RSrc1, RSrc2, PredEnc);
+        if (S1C) Regs.freeReg(RSrc1);
+        if (S2C) Regs.freeReg(RSrc2);
+      } else if (isa<FCmpInst>(&I)) {
+        auto *FC = cast<FCmpInst>(&I);
+        unsigned RDst = Regs.alloc(&I);
+        bool S1C = isa<ConstantFP>(FC->getOperand(0));
+        bool S2C = isa<ConstantFP>(FC->getOperand(1));
+        unsigned RSrc1 = S1C ? Regs.allocRaw() : 0;
+        unsigned RSrc2 = S2C ? Regs.allocRaw() : 0;
+        if (!S1C) RSrc1 = Regs.consume(FC->getOperand(0));
+        if (!S2C) RSrc2 = Regs.consume(FC->getOperand(1));
+        if (S1C) {
+          uint32_t Bits = cast<ConstantFP>(FC->getOperand(0))->getValueAPF().bitcastToAPInt().getZExtValue();
+          emitInsn32(BC, VM_LI32, RSrc1, Bits);
+        }
+        if (S2C) {
+          uint32_t Bits = cast<ConstantFP>(FC->getOperand(1))->getValueAPF().bitcastToAPInt().getZExtValue();
+          emitInsn32(BC, VM_LI32, RSrc2, Bits);
+        }
+        uint8_t PredEnc = mapFCmpPred(FC->getPredicate());
+        if (FC->getOperand(0)->getType()->isDoubleTy())
+          PredEnc |= 0x10;  // bit 4 = double width
+        emitInsn(BC, VM_FCMP, RDst, RSrc1, RSrc2, PredEnc);
         if (S1C) Regs.freeReg(RSrc1);
         if (S2C) Regs.freeReg(RSrc2);
       } else if (isa<UncondBrInst>(&I)) {

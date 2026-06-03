@@ -90,12 +90,13 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 | 0x03   | LI       | `LI rdst, #imm`         | 加载 16 位立即数到目标寄存器           |
 | 0x04   | LI32     | `LI32 rdst, #imm32`     | 加载 32 位立即数到目标寄存器           |
 | 0x05   | MOV      | `MOV rdst, rsrc`        | rdst = rsrc (寄存器复制)              |
-| 0x06   | CMP      | `CMP rdst, rsrc1, rsrc2`| 比较 rsrc1 与 rsrc2（谓词在 flags 低 4 位），结果 0/1 写入 rdst |
-| 0x07   | JMP      | `JMP #offset`           | 无条件跳转，offset 为有符号 16 位相对偏移 |
-| 0x08   | BR       | `BR rcond, #offset`     | 条件跳转，rcond ≠ 0 时跳转 offset 字节 |
-|        | **函数调用** (0x09-0x0A) | | |
-| 0x09   | SETARG   | `SETARG slot, rsrc`     | 设置调用参数槽。flags bit0=1 浮点→`call_args_fp`，否则→`call_args` |
-| 0x0A   | CALL     | `CALL rdst, [func_idx]` | 调用 `func_table[src1]`。flags bit0=1 读 XMM0 返回，否则读 RAX |
+| 0x06   | CMP      | `CMP rdst, rsrc1, rsrc2`| 整数比较，谓词在 flags 低 4 位，结果 0/1 写入 rdst |
+| 0x07   | FCMP     | `FCMP rdst, rsrc1, rsrc2`| 浮点比较，谓词在 flags 低 4 位，bit4=1 为 double |
+| 0x08   | JMP      | `JMP #offset`           | 无条件跳转，offset 为有符号 16 位相对偏移 |
+| 0x09   | BR       | `BR rcond, #offset`     | 条件跳转，rcond ≠ 0 时跳转 offset 字节 |
+|        | **函数调用** (0x0A-0x0B) | | |
+| 0x0A   | SETARG   | `SETARG slot, rsrc`     | 设置调用参数槽。flags bit0=1 浮点→`call_args_fp`，否则→`call_args` |
+| 0x0B   | CALL     | `CALL rdst, [func_idx]` | 调用 `func_table[src1]`。flags bit0=1 读 XMM0 返回，否则读 RAX |
 |        | **整数算术** (0x10–0x1F) | | |
 | 0x10   | ADD      | `ADD rdst, rsrc1, rsrc2`| rdst = rsrc1 + rsrc2 (整数加法)        |
 | 0x11   | SUB      | `SUB rdst, rsrc1, rsrc2`| rdst = rsrc1 - rsrc2 (整数减法)        |
@@ -173,13 +174,20 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
 
 - src2 始终为寄存器，不支持立即数（避免与 predicate flags 冲突）
 
-**JMP** (0x07)
-- 编码: `[0x07][0][0][offset_lo(2)][0]`
+**FCMP** (0x07)
+- 编码: `[0x07][flags(1)][dst(2)][src1(2)][src2(2)]`
+- 比较 `r[src1]` 与 `r[src2]` 的浮点值，结果写入 `rdst`
+- flags 低 4 位编码比较谓词，与 CMP 相同（0=EQ … 5=NE, 6=ORD, 7=UNO）
+- **flags bit 4** = 1 时比较 `double`（64 位），否则比较 `float`（32 位）
+- NaN 处理：ordered 谓词（OEQ/OGT/OGE/OLT/OLE/ONE）在任一操作数为 NaN 时返回 false；unordered 谓词（UEQ/UGT/UGE/ULT/ULE/UNE）在任一操作数为 NaN 时返回 true
+
+**JMP** (0x08)
+- 编码: `[0x08][0][0][offset_lo(2)][0]`
 - `pc = pc + 8 + (int16_t)src1`，src1 为有符号 16 位相对偏移（相对于下一条指令）
 - dst/src2 字段保留（编码为 0）
 
-**BR** (0x08)
-- 编码: `[0x08][flags][0][rcond(2)][offset(2)]`
+**BR** (0x09)
+- 编码: `[0x09][flags][0][rcond(2)][offset(2)]`
 - 若 `r[rcond] != 0` 则 `pc = pc + 8 + (int16_t)src2`，否则 `pc = pc + 8`
 - **flags bit 0 (VM_FLAG_BR_NT)**：条件取反。置位时，`r[rcond] == 0` 触发跳转，`r[rcond] != 0` 时继续执行
 - dst 字段保留（编码为 0）
@@ -189,15 +197,15 @@ LOAD 使用 **bit 3** 指示浮点加载（不符号扩展整数，直接复制�
   - 真目标为下一块：使用 `BR!`（置位 VM_FLAG_BR_NT），条件成立时不跳转（fall through 到真目标），否则跳假目标
   - 以上两情形均可消除冗余 JMP 指令
 
-**SETARG** (0x09)
-- 编码: `[0x09][flags(1)][slot(2)][src_reg(2)][0]`
+**SETARG** (0x0A)
+- 编码: `[0x0A][flags(1)][slot(2)][src_reg(2)][0]`
 - 设置调用参数槽：`ctx.call_args[dst] = ctx.r[src1]`
 - `slot`（dst 字段）取值 0-7，对应 `call_args[slot]`
 - **flags bit 0**：参数类型。0 = 整数/指针 → 写入 `call_args[slot]`（通用寄存器），1 = 浮点 → 写入 `call_args_fp[slot]`（XMM 寄存器）
 - 对可变参数函数（如 `printf`），浮点参数会额外写入 `call_args[slot]`（满足 Win64 变参 shadow 要求）
 
-**CALL** (0x0A)
-- 编码: `[0x0A][flags(1)][ret_reg(2)][func_idx(2)][0]`
+**CALL** (0x0B)
+- 编码: `[0x0B][flags(1)][ret_reg(2)][func_idx(2)][0]`
 - 调用 `func_table[func_idx]`，返回值存入 `ctx.r[ret_reg]`（`ret_reg = 0` 时忽略）
 - **flags** 使用 2 个独立位控制参数传递方式和返回类型：
 
@@ -344,6 +352,7 @@ C 调用:
 | `const int`     | `LI rdst, #imm` |
 | `const float`   | `LI32 rdst, #imm32` (加载浮点位模式) |
 | `icmp eq/ne/...`| `CMP rdst, rsrc1, rsrc2` (predicate 编码在 flags 低 4 位) |
+| `fcmp oeq/olt/...` | `FCMP rdst, rsrc1, rsrc2` (predicate 编码同 CMP，bit4=1 为 double) |
 | `br label`      | `JMP #offset` |
 | `br i1 cond, label, label` | `BR rcond, #offset` (true → BR, false → JMP，相邻目标时优化 JMP)` |
 | `phi`           | 降级为 `MOV` 指令，在前驱块末尾插入，当前块跳过生成 |
@@ -360,8 +369,8 @@ C 调用:
 | 整数位运算 | ✅ ✅ ✅ | and, or, xor |
 | 浮点算术 | ✅ ✅ ✅ ✅ ❌ | fadd, fsub, fmul, fdiv 使用专用浮点 ALU；frem 暂不支持 |
 | 控制流 | ✅ ✅ ❌ ❌ ❌ | br (无条件/条件), phi (MOV 降级) ✅ / switch, select, indirectbr 等 ✗ |
-| 比较 | ✅ ❌ | icmp ✅ / fcmp ✗ |
-| 类型转换 | ✅ ✅ ✅ ✅ ❌ ❌ ❌ ❌ | sitofp, fptosi, fptrunc, fpext ✓ / trunc, zext, sext 等 ✗ |
+| 比较 | ✅ ✅ | icmp, fcmp |
+| 类型转换 | ✅ ✅ ✅ ✅ ✅ ✅ ✅ ❌ ❌ | sitofp, fptosi, fptrunc, fpext, sext, zext, trunc ✓ / uitofp, fptoui ✗ |
 | 聚合操作 | ❌ ❌ ❌ ❌ ❌ | extractvalue, insertvalue, 向量操作 |
 | 函数调用 | ✅ ✅ | call (SETARG+CALL 汇编跳板，支持整数/浮点参数及返回值) |
 
@@ -395,7 +404,6 @@ C 调用:
 
 | IR 指令 | 说明 |
 |---------|------|
-| `fcmp` | ❌ 浮点比较 |
 | `frem` | ❌ 浮点取余 |
 
 ### 内存内联函数 — 低优先级

@@ -327,6 +327,25 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             print_reg_result(dst, r);
             break;
         }
+        case VM_FCMP: {
+#define FCMP_BODY(T, sz) do { T a,b; memcpy(&a,&ctx.r[src1],sz); memcpy(&b,&ctx.r[src2],sz); \
+    uint8_t _p=flg&0x0F; uintptr_t _r=0; \
+    switch(_p) { \
+    case 0:_r=(a==b)?1:0;break; case 1:_r=(a>b)?1:0;break; case 2:_r=(a>=b)?1:0;break; \
+    case 3:_r=(a<b)?1:0;break; case 4:_r=(a<=b)?1:0;break; case 5:_r=(a!=b)?1:0;break; \
+    case 6:_r=(!isnan(a)&&!isnan(b))?1:0;break; case 7:_r=(isnan(a)||isnan(b))?1:0;break; \
+    case 8:_r=(a==b||isnan(a)||isnan(b))?1:0;break; case 9:_r=(a>b||isnan(a)||isnan(b))?1:0;break; \
+    case 10:_r=(a>=b||isnan(a)||isnan(b))?1:0;break; case 11:_r=(a<b||isnan(a)||isnan(b))?1:0;break; \
+    case 12:_r=(a<=b||isnan(a)||isnan(b))?1:0;break; case 13:_r=(a!=b||isnan(a)||isnan(b))?1:0;break; \
+    default:fprintf(stderr,"[VM] bad fcmp pred %u\n",_p);goto cleanup; \
+    } ctx.r[dst]=_r; \
+} while(0)
+            if (flg & 0x10) FCMP_BODY(double, 8);
+            else             FCMP_BODY(float, 4);
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+#undef FCMP_BODY
+        }
         case VM_JMP: {
             int32_t rel = (int32_t)(int16_t)src1;
             pc = pc + 8 + rel;

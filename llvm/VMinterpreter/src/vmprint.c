@@ -50,6 +50,8 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     case VM_MOV:   printf("  0x%04X: MOV    r%u, r%u\n",       off, dst, src1); break;
     case VM_CMP:   printf("  0x%04X: CMP    r%u, r%u, r%u  ", off, dst, src1, src2);
                    printf("(pred=%u)", flg & 0x0F); break;
+    case VM_FCMP:  printf("  0x%04X: FCMP   r%u, r%u, r%u  ", off, dst, src1, src2);
+                   printf("(pred=%u%s)", flg & 0x0F, (flg & 0x10)?" d":""); break;
     case VM_JMP:   printf("  0x%04X: JMP    #%+d\n",          off, (int16_t)src1); break;
     case VM_BR:    printf("  0x%04X: BR%s    r%u, #%+d\n",    off, (flg & VM_FLAG_BR_NT)?"!":"", src1, (int16_t)src2); break;
     case VM_SETARG: printf("  0x%04X: SETARG%s r%u, r%u\n", off, (flg & 1)?"fp ":"   ", dst, src1); break;

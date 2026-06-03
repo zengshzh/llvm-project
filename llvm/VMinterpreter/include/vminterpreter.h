@@ -18,11 +18,12 @@ enum VM_Opcode {
   VM_LI     = 0x03,
   VM_LI32   = 0x04,
   VM_MOV    = 0x05,   // rdst = rsrc1
-  VM_CMP    = 0x06,   // rdst = (rsrc1 pred rsrc2) ? 1 : 0
-  VM_JMP    = 0x07,   // pc += (int16_t)src1
-  VM_BR     = 0x08,   // if rsrc1 != 0 then pc += (int16_t)src2
-  VM_SETARG = 0x09,   // ctx.call_args[dst] = ctx.r[src1]
-  VM_CALL   = 0x0A,   // call func_table[src1], ret → rdst
+  VM_CMP    = 0x06,   // int compare: rdst = (rsrc1 pred rsrc2) ? 1 : 0
+  VM_FCMP   = 0x07,   // float compare: rdst = (rsrc1 pred rsrc2) ? 1 : 0
+  VM_JMP    = 0x08,   // pc += (int16_t)src1
+  VM_BR     = 0x09,   // if rsrc1 != 0 then pc += (int16_t)src2
+  VM_SETARG = 0x0A,   // ctx.call_args[dst] = ctx.r[src1]
+  VM_CALL   = 0x0B,   // call func_table[src1], ret → rdst
 
   // ── Integer arithmetic ──
   VM_ADD    = 0x10,
