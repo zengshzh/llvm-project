@@ -328,8 +328,11 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 
 | IR 指令 | 说明 |
 |---------|------|
-| `memcpy` / `memmove` | 内存拷贝（`@llvm.memcpy.*`） |
-| `memset` | 内存设置（`@llvm.memset.*`） |
+| `lifetime.start` / `lifetime.end` | ✅ 生命周期标记（VM 中为空操作，跳过不处理） |
+| `memcpy` / `memmove` | ❌ 内存拷贝（`@llvm.memcpy.*`） |
+| `memset` | ❌ 内存设置（`@llvm.memset.*`） |
+
+> 注：`@llvm.lifetime.start/end` 开启 `-O3` 后由 LLVM 自动插入，CodeGen 直接跳过不生成字节码，也不再加入函数表。
 
 ### 聚合操作
 
@@ -384,12 +387,11 @@ void test(Results *r) {
 
 生成的字节码中，`teststr` 被分配全局寄存器 rN，`testint` 被分配 rN+1。`strlen` 的参数通过 `SETARG r0, rN` 传入，`load i32, i32* @testint` 通过 `LOAD.4 rdst, r(N+1)` 执行。
 
-## 未支持的特性
-- 开启优化(-O3)以后，会报错
-```
-/usr/bin/x86_64-linux-gnu-ld.bfd: /tmp/test-04ccf1.o:(.data.rel.ro+0x0): undefined reference to `llvm.lifetime.start.p0'
-/usr/bin/x86_64-linux-gnu-ld.bfd: /tmp/test-04ccf1.o:(.data.rel.ro+0x8): undefined reference to `llvm.lifetime.end.p0'
-```
+## 已修复的问题
+### `-O3` 生命周期内联函数链接错误 (已修复)
+开启优化(`-O3`)后，LLVM 自动插入的 `@llvm.lifetime.start.p0` / `@llvm.lifetime.end.p0` 生命周期标记内联函数会被 CodeGen 当成普通外部函数调用处理，导致链接器报未定义引用。
+
+**修复：** VMCodeGen.cpp 中 CallInst 处理分支跳过这些内联函数（不生成字节码、不加入函数表），同时正确消耗操作数以维持寄存器追踪的正确性。
 
 ## Example
 
