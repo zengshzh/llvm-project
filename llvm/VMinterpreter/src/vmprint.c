@@ -16,6 +16,7 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     uint16_t dst  = bc[off + 2] | (uint16_t)bc[off + 3] << 8;
     uint16_t src1 = bc[off + 4] | (uint16_t)bc[off + 5] << 8;
     uint16_t src2 = bc[off + 6] | (uint16_t)bc[off + 7] << 8;
+    (void)dst; (void)src1; (void)src2;
     switch (op) {
     case VM_ALLOCA:
         if (flg & 1)
@@ -25,11 +26,13 @@ void print_insn(const uint8_t *bc, uint32_t off) {
         break;
     case VM_LOAD:  {
         unsigned sz = (flg & 0x0F) + 1;
+        (void)sz;
         PRINTF("  0x%04X: LOAD.%u r%u, r%u",  off, sz, dst, src1);
         break;
     }
     case VM_STORE: {
         unsigned sz = (flg & 0x0F) + 1;
+        (void)sz;
         PRINTF("  0x%04X: STORE.%u r%u, r%u",   off, sz, src1, dst);
         break;
     }
