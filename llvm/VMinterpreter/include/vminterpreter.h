@@ -70,7 +70,7 @@ enum VM_Opcode {
 // CALL 标志位（与通用 flags 共用字节）
 #define VM_CALL_RET_FP   1   // bit 0: 返回值在 XMM0（浮点），否则 RAX（整数）
 #define VM_CALL_ARG_FP   2   // bit 1: 参数全为浮点 → FPVMCallFn
-#define VM_CALL_ARG_MIX  4   // bit 2: 参数混合整数+浮点 → 汇编跳板
+#define VM_CALL_ARG_MIX  4   // bit 2: 参数混合整数+浮点 → libffi
 
 void print_insn(const uint8_t *bc, uint32_t off);
 void hexdump(const uint8_t *bc, uint32_t size);

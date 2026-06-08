@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <math.h>
+#include <ffi.h>
 #include "vminterpreter.h"
 
 // Saved register values from VMSaveReg, consumed by VMExecute
@@ -55,25 +56,19 @@ static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t p
 
 // 4 universal call types for dispatch without assembly
 // Type 1: int args → GP regs, int ret ← RAX
-typedef void *(*VMCallFn)(void*, void*, void*, void*,
-                          void*, void*, void*, void*);
+typedef uintptr_t (*IntRetCallFn)(void*, void*, void*, void*,
+                                  void*, void*, void*, void*);
 // Type 2: int args → GP regs, fp ret ← XMM0
 typedef double (*DblRetCallFn)(void*, void*, void*, void*,
                                void*, void*, void*, void*);
-// Type 3: fp args → XMM regs, int ret ← RAX (rare, truncate)
+// Type 3: fp args → XMM regs, int ret ← RAX
+typedef uintptr_t (*FPIntRetCallFn)(double, double, double, double,
+                                    double, double, double, double);
 // Type 4: fp args → XMM regs, fp ret ← XMM0
 typedef double (*FPVMCallFn)(double, double, double, double,
                              double, double, double, double);
 
 #define ARGS8(a)  a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]
-// Assembly trampoline for mixed int/fp arguments
-struct vmcall_result {
-    uintptr_t int_ret;
-    double    fp_ret;
-};
-extern void vm_call_trampoline(void *func, void **int_args,
-                               double *fp_args,
-                               struct vmcall_result *result);
 
 // ---- execution engine ----
 void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
@@ -414,35 +409,74 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             void *func = func_table[src1];
 
             if (flg & VM_CALL_ARG_MIX) {
-                // ── Mixed int+fp args: use assembly trampoline (case 5-6) ──
-                struct vmcall_result res;
-                vm_call_trampoline(func, ctx.call_args, ctx.call_args_fp, &res);
-                if (dst) {
-                    if (flg & VM_CALL_RET_FP) memcpy(&ctx.r[dst], &res.fp_ret, 8);
-                    else                      ctx.r[dst] = res.int_ret;
+                // ── Mixed int+fp args: use libffi ──
+                uint8_t raw = bc[pc + 6];
+                uint8_t arg_count = raw & 0x0F;
+                uint8_t fixed_count = (raw >> 4) & 0x0F;
+                uint8_t type_mask = bc[pc + 7];
+                if (arg_count > 8) arg_count = 8;
+                if (fixed_count > arg_count) fixed_count = arg_count;
+
+                ffi_type *arg_types[8];
+                void *arg_values[8];
+                for (unsigned i = 0; i < arg_count; i++) {
+                    if (type_mask & (1 << i)) {
+                        arg_types[i] = &ffi_type_double;
+                        arg_values[i] = &ctx.call_args_fp[i];
+                    } else {
+                        arg_types[i] = &ffi_type_pointer;
+                        arg_values[i] = &ctx.call_args[i];
+                    }
+                }
+
+                ffi_type *rtype = (flg & VM_CALL_RET_FP)
+                                      ? &ffi_type_double
+                                      : &ffi_type_pointer;
+                ffi_cif cif;
+                ffi_status st;
+                if (fixed_count < arg_count)
+                    st = ffi_prep_cif_var(&cif, FFI_DEFAULT_ABI, fixed_count,
+                                          arg_count, rtype, arg_types);
+                else
+                    st = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, arg_count,
+                                      rtype, arg_types);
+                if (st != FFI_OK) {
+                    fprintf(stderr, "[VM] ffi_prep_cif%s failed at 0x%04X\n",
+                            (fixed_count < arg_count) ? "_var" : "", pc);
+                    goto cleanup;
+                }
+
+                if (flg & VM_CALL_RET_FP) {
+                    double result;
+                    ffi_call(&cif, FFI_FN(func), &result, arg_values);
+                    if (dst) memcpy(&ctx.r[dst], &result, sizeof(double));
+                } else {
+                    uintptr_t result = 0;
+                    ffi_call(&cif, FFI_FN(func), &result, arg_values);
+                    if (dst) ctx.r[dst] = result;
                 }
             } else if (flg & VM_CALL_ARG_FP) {
-                // ── Pure fp args: use FPVMCallFn (case 3-4) ──
-                FPVMCallFn fn = (FPVMCallFn)func;
-                double r = fn(ARGS8(ctx.call_args_fp));
-                if (dst) {
-                    if (flg & VM_CALL_RET_FP)
-                        memcpy(&ctx.r[dst], &r, 8);
-                    else
-                        ctx.r[dst] = (uintptr_t)(intptr_t)(int32_t)r;  // truncate double→int
+                if (flg & VM_CALL_RET_FP) {
+                    // Case 4: fp args + fp ret → FPVMCallFn (reads XMM0)
+                    FPVMCallFn fn = (FPVMCallFn)func;
+                    double r = fn(ARGS8(ctx.call_args_fp));
+                    if (dst) memcpy(&ctx.r[dst], &r, 8);
+                } else {
+                    // Case 3: fp args + int ret → FPIntRetCallFn (reads RAX)
+                    FPIntRetCallFn fn = (FPIntRetCallFn)func;
+                    ctx.r[dst] = fn(ARGS8(ctx.call_args_fp));
                 }
             } else {
-                // ── Pure int args: use VMCallFn or DblRetCallFn (case 1-2) ──
+                // ── Pure int args: use IntRetCallFn or DblRetCallFn (case 1-2) ──
                 if (flg & VM_CALL_RET_FP) {
                     // Case 2: int args + fp ret → DblRetCallFn (reads XMM0)
                     DblRetCallFn fn = (DblRetCallFn)func;
                     double r = fn(ARGS8(ctx.call_args));
                     if (dst) memcpy(&ctx.r[dst], &r, 8);
                 } else {
-                    // Case 1: int args + int ret → VMCallFn (reads RAX)
-                    VMCallFn fn = (VMCallFn)func;
-                    void *r = fn(ARGS8(ctx.call_args));
-                    if (dst) ctx.r[dst] = (uintptr_t)r;
+                    // Case 1: int args + int ret → IntRetCallFn (reads RAX)
+                    IntRetCallFn fn = (IntRetCallFn)func;
+                    ctx.r[dst] = fn(ARGS8(ctx.call_args));
                 }
             }
             memset(ctx.call_args, 0, sizeof(ctx.call_args));

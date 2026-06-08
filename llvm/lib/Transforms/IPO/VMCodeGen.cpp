@@ -807,9 +807,10 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         unsigned FuncIdx = It->second;
         // Determine arg types for CALL dispatch mode
         bool AllInt = true, AllFP = true;
+        uint16_t ArgMask = 0;  // bit i = 1 if arg i is float/double
         for (unsigned i = 0; i < NArgs && i < 8; i++) {
           Type *T = CI->getArgOperand(i)->getType();
-          if (T->isFloatTy() || T->isDoubleTy()) AllInt = false;
+          if (T->isFloatTy() || T->isDoubleTy()) { AllInt = false; ArgMask |= (1 << i); }
           else AllFP = false;
         }
         bool RetFP = CI->getType()->isFloatTy() || CI->getType()->isDoubleTy();
@@ -844,15 +845,24 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         // Select CALL flags:
         //   bit 0: VM_CALL_RET_FP  — 1=fp return (XMM0)
         //   bit 1: VM_CALL_ARG_FP  — 1=all fp args (FPVMCallFn)
-        //   bit 2: VM_CALL_ARG_MIX — 1=mixed int+fp args (assembly)
+        //   bit 2: VM_CALL_ARG_MIX — 1=mixed int+fp args → libffi
         uint8_t CallFlags = (RetFP ? VM_CALL_RET_FP : 0);
         if (!AllInt && !AllFP) {
-          CallFlags |= VM_CALL_ARG_MIX;   // mixed → assembly trampoline
+          CallFlags |= VM_CALL_ARG_MIX;
         } else if (AllFP) {
           CallFlags |= VM_CALL_ARG_FP;    // pure fp → FPVMCallFn
         }
         // else pure int → VMCallFn or DblRetCallFn (based on ret type)
-        emitInsn(BC, VM_CALL, RetReg, FuncIdx, 0, CallFlags);
+        // Encode args info in bytes 6-7 for libffi (mixed mode):
+        //   byte 6 low nibble  = arg_count (clamped to 8)
+        //   byte 6 high nibble = fixed_arg_count (for variadic, else == arg_count)
+        //   byte 7 = type_mask (bit i = float arg i)
+        uint16_t ArgCount = (NArgs > 8) ? 8 : NArgs;
+        unsigned NumFixed = Callee->getFunctionType()->getNumParams();
+        uint16_t FixedCount = (NumFixed > ArgCount) ? ArgCount : (uint16_t)NumFixed;
+        uint16_t ArgInfo = (ArgCount & 0x0F) | ((FixedCount & 0x0F) << 4)
+                         | ((ArgMask & 0xFF) << 8);
+        emitInsn(BC, VM_CALL, RetReg, FuncIdx, ArgInfo, CallFlags);
       } else {
         report_fatal_error(
             Twine("[VMCodeGen] unsupported instruction: ") +

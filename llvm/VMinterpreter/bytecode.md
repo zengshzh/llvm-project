@@ -193,101 +193,54 @@ ADD  rtmp, r_input, r_i    ; rtmp = input + i * 1
 - 对可变参数函数（如 `printf`），浮点参数会额外写入 `call_args[slot]`（满足 Win64 变参 shadow 要求）
 
 **CALL** (0x0B)
-- 编码: `[0x0B][flags(1)][ret_reg(2)][func_idx(2)][0]`
+- 编码: `[0x0B][flags(1)][ret_reg(2)][func_idx(2)][arg_info(1)][type_mask(1)]`
 - 调用 `func_table[func_idx]`，返回值存入 `ctx.r[ret_reg]`（`ret_reg = 0` 时忽略）
-- **flags** 使用 2 个独立位控制参数传递方式和返回类型：
+
+- **flags** 使用 3 个独立位控制参数传递方式和返回类型：
 
   | bit | 常量 | 含义 |
   |-----|------|------|
   | 0 | `VM_CALL_RET_FP` | 返回类型：0=RAX（整数/指针），1=XMM0（浮点） |
-  | 1 | `VM_CALL_ARG_FP` | 参数类型：0=整数/指针，1=浮点（仅当全部参数类型一致时设置） |
-  | 2 | `VM_CALL_ARG_MIX` | 参数混合：1=同时存在整数和浮点参数，需用汇编跳板 |
+  | 1 | `VM_CALL_ARG_FP` | 参数全为浮点 → `FPVMCallFn` |
+  | 2 | `VM_CALL_ARG_MIX` | 参数混合整数+浮点 → libffi |
 
-- **6 种分派路径**（4 种函数指针 + 汇编跳板）：
+- **6 种分派路径**（4 种函数指针 + libffi）：
 
-  | flags | 参数 | 返回 | 路径 | 函数指针类型 |
-  |-------|------|------|------|------------|
+  | flags | 参数 | 返回 | 路径 | 说明 |
+  |-------|------|------|------|------|
   | 0 | 纯整数 | RAX | **VMCallFn** | `void* (*)(void*×8)` |
-  | 1 | 纯整数 | XMM0 | **DblRetCallFn** ← 新！ | `double (*)(void*×8)` |
+  | 1 | 纯整数 | XMM0 | **DblRetCallFn** | `double (*)(void*×8)` |
   | 2 | 纯浮点 | RAX | FPVMCallFn + truncate | `double (*)(double×8)` |
   | 3 | 纯浮点 | XMM0 | **FPVMCallFn** | `double (*)(double×8)` |
-  | 4 | 混合 | RAX | 汇编跳板 | `vm_call_trampoline` |
-  | 5 | 混合 | XMM0 | 汇编跳板 | `vm_call_trampoline` |
+  | 4 | 混合 | RAX | **libffi** | `ffi_call`，非变参用 `ffi_prep_cif`，变参用 `ffi_prep_cif_var` |
+  | 5 | 混合 | XMM0 | **libffi** | 同上 |
+
+- **混合模式（flags bit2=1）下 bytes 6-7**：
+  - `byte 6` 低 4 位 = 参数总个数（0-8，截断到 8）
+  - `byte 6` 高 4 位 = 固定参数个数（可变参数函数的前 N 个命名参数，非可变参数时等于总个数）
+  - `byte 7` = 类型掩码（bit i = 1 表示第 i 个参数为浮点，0 为整数/指针）
+- **非混合模式下 bytes 6-7** 被忽略
 
   各路径说明：
   - **VMCallFn**：`void*` 参数全部走通用寄存器，`void*` 返回值读 RAX。纯整数参数 + 整数返回的标准路径。
   - **DblRetCallFn**：`void*` 参数走通用寄存器，但返回值读 **XMM0**。解决 `sin(int)→double` 这类参数是整数但返回值是浮点的场景。
   - **FPVMCallFn**：`double` 参数走 XMM 寄存器，返回值读 XMM0。纯浮点参数的标准路径。返回 RAX 时截断 `double` 到 `int`。
-  - **汇编跳板**：当参数同时包含整数和浮点类型时，需要同时设置 GP 和 XMM 寄存器，使用 `vm_call_trampoline` 函数。
+  - **libffi**：混合参数时，根据 byte 6 中的参数信息（总个数 + 固定参数个数 + 类型掩码），非变参调用 `ffi_prep_cif`，变参调用 `ffi_prep_cif_var`，然后通过 `ffi_call` 执行。libffi 自动处理各平台的调用约定（寄存器分配、栈布局等），无需平台相关的汇编代码。
 
   参数通过 `SETARG` 预先设置到 `call_args[0..7]`（整数槽 GP 寄存器）和 `call_args_fp[0..7]`（浮点槽 XMM 寄存器）。CodeGen 根据所有参数类型和返回类型自动选择最佳路径。
 
 ### 参数传递机制
 
-`VM_CALL` 使用平台相关的汇编跳板实现正确的硬件调用约定。当前支持三个平台：
+`VM_CALL` 根据参数类型选择不同的调用路径：
+- **纯整数/纯浮点参数**：使用 C 函数指针直接调用（`VMCallFn` / `DblRetCallFn` / `FPVMCallFn`），编译器自动生成正确的调用约定。
+- **混合参数（整数+浮点）**：使用 **libffi** 库动态处理平台相关的调用约定。
 
-| 平台 | 汇编文件 | 整数寄存器 | 浮点寄存器 | 栈参数 |
-|------|---------|-----------|-----------|--------|
-| Windows x64 | `vmcall_win64.S` | RCX, RDX, R8, R9 | XMM0-XMM3 | 第 5-8 参数 |
-| Linux x64 | `vmcall_linux64.S` | RDI, RSI, RDX, RCX, R8, R9 | XMM0-XMM7 | 第 7-8 参数 |
-| Linux ARM64 | `vmcall_linux_arm64.S` | X0-X7 | D0-D7 | 第 9+ 参数 |
+libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_linux64.S`、`vmcall_linux_arm64.S`）处理的寄存器分配和栈布局工作。`libffi` 通过字节码中编码的参数信息（参数个数、固定参数个数、类型掩码），自动为每个目标平台生成正确的调用序列：
 
-#### Windows x64 (Microsoft x64 calling convention)
+- **非可变参数**：调用 `ffi_prep_cif` 描述函数签名，再通过 `ffi_call` 执行
+- **可变参数**：调用 `ffi_prep_cif_var`，区分固定参数与可变参数部分，libffi 自动处理各平台的可变参数传递规则（如 Win64 中可变浮点参数走整数寄存器/栈）
 
-```
-C 调用:
-  vm_call_trampoline(func, int_args, fp_args, &result)
-
-汇编跳板:
-  ┌─ 保存参数（func, int_args, fp_args, result）到栈上
-  ├─ 从 int_args[0..3] 加载 RCX, RDX, R8, R9    ← 整数/指针参数
-  ├─ 从 int_args[4..7] 拷贝到 [RSP+32..63]        ← 第 5-8 个整数参数（栈上）
-  ├─ 从 fp_args[0..3] 加载 XMM0 ~ XMM3          ← 浮点参数
-  ├─ call func                                   ← 统一调用
-  └─ 存储 RAX → result->int_ret, XMM0 → result->fp_ret
-```
-
-寄存器分配：
-
-| 寄存器 | 用途 | 来源 |
-|--------|------|------|
-| RCX | 第 1 个整数/指针参数 | `call_args[0]` |
-| RDX | 第 2 个整数/指针参数 | `call_args[1]` |
-| R8 | 第 3 个整数/指针参数 | `call_args[2]` |
-| R9 | 第 4 个整数/指针参数 | `call_args[3]` |
-| [RSP+32..63] | 第 5-8 个整数/指针参数 | `call_args[4..7]` |
-| XMM0 | 第 1 个浮点参数 | `call_args_fp[0]` |
-| XMM1 | 第 2 个浮点参数 | `call_args_fp[1]` |
-| XMM2 | 第 3 个浮点参数 | `call_args_fp[2]` |
-| XMM3 | 第 4 个浮点参数 | `call_args_fp[3]` |
-| RAX (返回值) | 整数/指针返回值 | `result->int_ret` |
-| XMM0 (返回值) | 浮点返回值 | `result->fp_ret` |
-
-> 对于混合参数（如 `int func(double, int)`），第 1 个浮点参数通过 XMM0 传递，XMM0 对应的 RCX 槽位在 Win64 中未定义。跳板同时设置两种寄存器，函数按类型选择正确的来源。
-
-#### Linux x86-64 (System V AMD64)
-
-| 寄存器 | 用途 | 来源 |
-|--------|------|------|
-| RDI | 第 1 个整数/指针参数 | `call_args[0]` |
-| RSI | 第 2 个整数/指针参数 | `call_args[1]` |
-| RDX | 第 3 个整数/指针参数 | `call_args[2]` |
-| RCX | 第 4 个整数/指针参数 | `call_args[3]` |
-| R8 | 第 5 个整数/指针参数 | `call_args[4]` |
-| R9 | 第 6 个整数/指针参数 | `call_args[5]` |
-| [RSP+0..15] | 第 7-8 个整数/指针参数 | `call_args[6..7]` |
-| XMM0-XMM7 | 第 1-8 个浮点参数 | `call_args_fp[0..7]` |
-| RAX (返回值) | 整数/指针返回值 | `result->int_ret` |
-| XMM0 (返回值) | 浮点返回值 | `result->fp_ret` |
-
-#### Linux ARM64 (AArch64)
-
-| 寄存器 | 用途 | 来源 |
-|--------|------|------|
-| X0-X7 | 第 1-8 个整数/指针参数 | `call_args[0..7]` |
-| D0-D7 | 第 1-8 个浮点参数 | `call_args_fp[0..7]` |
-| X0 (返回值) | 整数/指针返回值 | `result->int_ret` |
-| D0 (返回值) | 浮点返回值 | `result->fp_ret` |
+参数通过 `SETARG` 预先设置到 `call_args[0..7]`（整数槽）和 `call_args_fp[0..7]`（浮点槽），libffi 从对应的数组中读取每个参数的值。
 
 **RET** (0xFF)
 - 编码: `[0xFF][flags(0)][rval(2)][0][0]`
@@ -345,7 +298,7 @@ C 调用:
 | 比较 | ✅ ✅ | icmp, fcmp |
 | 类型转换 | ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ | sitofp, fptosi, fptrunc, fpext, sext, zext, trunc, uitofp, fptoui 全部支持 |
 | 聚合操作 | ❌ ❌ ❌ ❌ ❌ | extractvalue, insertvalue, 向量操作 |
-| 函数调用 | ✅ ✅ | call (SETARG+CALL 汇编跳板，支持整数/浮点参数及返回值) |
+| 函数调用 | ✅ ✅ ✅ | call (SETARG+CALL: 纯整数/浮点→函数指针, 混合→libffi) |
 
 ## 未支持的 IR 指令
 
@@ -432,7 +385,6 @@ void test(Results *r) {
 生成的字节码中，`teststr` 被分配全局寄存器 rN，`testint` 被分配 rN+1。`strlen` 的参数通过 `SETARG r0, rN` 传入，`load i32, i32* @testint` 通过 `LOAD.4 rdst, r(N+1)` 执行。
 
 ## 未支持的特性
-- 混合参数模式只在windows上跑测过，其他平台待验证
 - 开启优化(-O3)以后，会报错
 ```
 /usr/bin/x86_64-linux-gnu-ld.bfd: /tmp/test-04ccf1.o:(.data.rel.ro+0x0): undefined reference to `llvm.lifetime.start.p0'
