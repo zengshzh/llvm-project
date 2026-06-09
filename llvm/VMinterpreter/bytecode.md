@@ -1,5 +1,73 @@
 # VM Bytecode Specification
 
+## Example
+
+源 C 代码：
+```c
+__attribute__((annotate("VMP")))
+int test(int a, int b) {
+    int x = a;
+    int y = b;
+    int s = x + y;
+    int p = s * x;
+    int q = p / y;
+    return q;
+}
+```
+
+生成的 bytecode：
+```
+  0x0000: ALLOCA r8, #4        ; x = alloca i32
+  0x0008: ALLOCA r9, #4        ; y = alloca i32
+  0x0010: ALLOCA r10, #4       ; s = alloca i32
+  0x0018: ALLOCA r11, #4       ; p = alloca i32
+  0x0020: ALLOCA r12, #4       ; q = alloca i32
+  0x0028: STORE  r0, r8        ; x = a (r0)
+  0x0030: STORE  r1, r9        ; y = b (r1)
+  0x0038: LOAD   r13, r8       ; load x
+  0x0040: LOAD   r14, r9       ; load y
+  0x0048: ADD    r15, r13, r14 ; s = x + y
+  0x0050: STORE  r15, r10      ; save s
+  0x0058: LOAD   r16, r8       ; load x
+  0x0060: MUL    r17, r15, r16 ; p = s * x
+  0x0068: STORE  r17, r11      ; save p
+  0x0070: LOAD   r18, r11      ; load p
+  0x0078: LOAD   r19, r9       ; load y
+  0x0080: DIV    r20, r18, r19 ; q = p / y
+  0x0088: STORE  r20, r12      ; save q
+  0x0090: LOAD   r21, r12      ; load q
+  0x0098: RET    r21
+```
+
+引用参数示例（ALLOCA 返回真实地址，LOAD/STORE 统一走原生内存）：
+```c
+__attribute__((annotate("VMP")))
+void test(uint32_t &a, uint32_t &b) {
+    int c = (a + b) * a / b;
+    a = c;
+}
+```
+
+生成的 bytecode：
+```
+  0x0000: ALLOCA r37, #8       ; alloca ptr (reference a)
+  0x0008: ALLOCA r38, #8       ; alloca ptr (reference b)
+  0x0010: ALLOCA r39, #4       ; c = alloca i32
+  0x0018: STORE  r0, r37       ; store reference ptr a to alloca
+  0x0020: STORE  r1, r38       ; store reference ptr b to alloca
+  0x0028: LOAD   r8, r37       ; r8 = *a (LOAD 统一走真实地址)
+  0x0030: LOAD   r9, r38       ; r9 = *b
+  0x0038: ADD    r10, r8, r9   ; c = a + b
+  ...
+  0x0050: STORE  r10, r37      ; *a = c (STORE 统一走真实地址)
+```
+
+### compile cmd
+```
+clang test.cpp -lvminterpreter -lffi -o test
+```
+clang，libvminterpreter.a是由本项目编译出来的，libffi.a是开源第三方库
+
 ## Instruction Encoding
 
 每条指令固定 **8 字节**，小端序：
@@ -393,64 +461,3 @@ void test(Results *r) {
 
 **修复：** VMCodeGen.cpp 中 CallInst 处理分支跳过这些内联函数（不生成字节码、不加入函数表），同时正确消耗操作数以维持寄存器追踪的正确性。
 
-## Example
-
-源 C 代码：
-```c
-__attribute__((annotate("VMP")))
-int test(int a, int b) {
-    int x = a;
-    int y = b;
-    int s = x + y;
-    int p = s * x;
-    int q = p / y;
-    return q;
-}
-```
-
-生成的 bytecode：
-```
-  0x0000: ALLOCA r8, #4        ; x = alloca i32
-  0x0008: ALLOCA r9, #4        ; y = alloca i32
-  0x0010: ALLOCA r10, #4       ; s = alloca i32
-  0x0018: ALLOCA r11, #4       ; p = alloca i32
-  0x0020: ALLOCA r12, #4       ; q = alloca i32
-  0x0028: STORE  r0, r8        ; x = a (r0)
-  0x0030: STORE  r1, r9        ; y = b (r1)
-  0x0038: LOAD   r13, r8       ; load x
-  0x0040: LOAD   r14, r9       ; load y
-  0x0048: ADD    r15, r13, r14 ; s = x + y
-  0x0050: STORE  r15, r10      ; save s
-  0x0058: LOAD   r16, r8       ; load x
-  0x0060: MUL    r17, r15, r16 ; p = s * x
-  0x0068: STORE  r17, r11      ; save p
-  0x0070: LOAD   r18, r11      ; load p
-  0x0078: LOAD   r19, r9       ; load y
-  0x0080: DIV    r20, r18, r19 ; q = p / y
-  0x0088: STORE  r20, r12      ; save q
-  0x0090: LOAD   r21, r12      ; load q
-  0x0098: RET    r21
-```
-
-引用参数示例（ALLOCA 返回真实地址，LOAD/STORE 统一走原生内存）：
-```c
-__attribute__((annotate("VMP")))
-void test(uint32_t &a, uint32_t &b) {
-    int c = (a + b) * a / b;
-    a = c;
-}
-```
-
-生成的 bytecode：
-```
-  0x0000: ALLOCA r37, #8       ; alloca ptr (reference a)
-  0x0008: ALLOCA r38, #8       ; alloca ptr (reference b)
-  0x0010: ALLOCA r39, #4       ; c = alloca i32
-  0x0018: STORE  r0, r37       ; store reference ptr a to alloca
-  0x0020: STORE  r1, r38       ; store reference ptr b to alloca
-  0x0028: LOAD   r8, r37       ; r8 = *a (LOAD 统一走真实地址)
-  0x0030: LOAD   r9, r38       ; r9 = *b
-  0x0038: ADD    r10, r8, r9   ; c = a + b
-  ...
-  0x0050: STORE  r10, r37      ; *a = c (STORE 统一走真实地址)
-```
