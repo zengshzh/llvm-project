@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -47,7 +46,7 @@ typedef struct {
 static inline int vm_src2(VMContext *ctx, uint8_t flg, uint16_t src2, uint32_t pc, uintptr_t *val) {
     if (flg & VM_FLAG_IMM) { *val = src2; return 0; }
     if (src2 >= ctx->nregs) {
-        fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc);
+        print_vm_error("[VM] src2 bounds at 0x%04X\n", pc);
         return -1;
     }
     *val = ctx->r[src2];
@@ -126,14 +125,14 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
         if (op == VM_JMP || op == VM_BR || op == VM_SETARG || op == VM_CALL) {
             // Bounds check only the register-referencing fields
             if (op == VM_SETARG && src1 > 0 && src1 >= ctx.nregs) {
-                fprintf(stderr, "[VM] src1 bounds at 0x%04X\n", pc); goto cleanup;
+                print_vm_error("[VM] src1 bounds at 0x%04X\n", pc); goto cleanup;
             }
             if (op == VM_CALL && dst > 0 && dst >= ctx.nregs) {
-                fprintf(stderr, "[VM] dst bounds at 0x%04X\n", pc); goto cleanup;
+                print_vm_error("[VM] dst bounds at 0x%04X\n", pc); goto cleanup;
             }
         } else {
             if (dst >= ctx.nregs || src1 >= ctx.nregs) {
-                fprintf(stderr, "[VM] reg bounds at 0x%04X\n", pc);
+                print_vm_error("[VM] reg bounds at 0x%04X\n", pc);
                 goto cleanup;
             }
         }
@@ -180,7 +179,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
               ctx.r[dst] = (uintptr_t)blk->mem;
             } else {
               if (ctx.vm_sp + alloc_size > ctx.mcap) {
-                fprintf(stderr, "[VM] ALLOCA oom at 0x%04X (need %zu, cap %zu)\n",
+                print_vm_error("[VM] ALLOCA oom at 0x%04X (need %zu, cap %zu)\n",
                         pc, ctx.vm_sp + (size_t)alloc_size, ctx.mcap);
                 goto cleanup;
               }
@@ -192,7 +191,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
         }
         case VM_LOAD: {
             uintptr_t load_addr = ctx.r[src1];
-            if (!load_addr) { fprintf(stderr, "[VM] load null at 0x%04X\n", pc); goto cleanup; }
+            if (!load_addr) { print_vm_error("[VM] load null at 0x%04X\n", pc); goto cleanup; }
             unsigned load_size = (flg & 0x0F) + 1;          // bits 0-3: size-1
             if (load_size > sizeof(uintptr_t)) load_size = sizeof(uintptr_t);
 
@@ -216,7 +215,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             unsigned store_size = (flg & 0x0F) + 1;         // bits 0-3: size-1
             if (store_size > sizeof(uintptr_t)) store_size = sizeof(uintptr_t);
             uintptr_t store_addr = ctx.r[dst];
-            if (!store_addr) { fprintf(stderr, "[VM] store null at 0x%04X\n", pc); goto cleanup; }
+            if (!store_addr) { print_vm_error("[VM] store null at 0x%04X\n", pc); goto cleanup; }
             memcpy((void *)store_addr, &ctx.r[src1], store_size);
             print_store_mem(store_addr, ctx.r[src1]);
             break;
@@ -330,7 +329,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             break;
         case VM_CMP: {
             if (src2 >= ctx.nregs) {
-                fprintf(stderr, "[VM] src2 bounds at 0x%04X\n", pc);
+                print_vm_error("[VM] src2 bounds at 0x%04X\n", pc);
                 goto cleanup;
             }
             uintptr_t a = ctx.r[src1], b = ctx.r[src2];
@@ -348,7 +347,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             case 8:  r = ((intptr_t)a <  (intptr_t)b) ? 1 : 0; break;  // SLT
             case 9:  r = ((intptr_t)a <= (intptr_t)b) ? 1 : 0; break;  // SLE
             default:
-                fprintf(stderr, "[VM] bad cmp pred %u at 0x%04X\n", pred, pc);
+                print_vm_error("[VM] bad cmp pred %u at 0x%04X\n", pred, pc);
                 goto cleanup;
             }
             ctx.r[dst] = r;
@@ -365,7 +364,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
     case 8:_r=(a==b||isnan(a)||isnan(b))?1:0;break; case 9:_r=(a>b||isnan(a)||isnan(b))?1:0;break; \
     case 10:_r=(a>=b||isnan(a)||isnan(b))?1:0;break; case 11:_r=(a<b||isnan(a)||isnan(b))?1:0;break; \
     case 12:_r=(a<=b||isnan(a)||isnan(b))?1:0;break; case 13:_r=(a!=b||isnan(a)||isnan(b))?1:0;break; \
-    default:fprintf(stderr,"[VM] bad fcmp pred %u\n",_p);goto cleanup; \
+    default:print_vm_error("[VM] bad fcmp pred %u\n",_p);goto cleanup; \
     } ctx.r[dst]=_r; \
 } while(0)
             if (flg & 0x10) FCMP_BODY(double, 8);
@@ -381,7 +380,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
         }
         case VM_BR: {
             if (src1 >= ctx.nregs) {
-                fprintf(stderr, "[VM] src1 bounds at 0x%04X\n", pc);
+                print_vm_error("[VM] src1 bounds at 0x%04X\n", pc);
                 goto cleanup;
             }
             int32_t rel = (int32_t)(int16_t)src2;
@@ -403,10 +402,10 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             break;
         case VM_CALL: {
             if (src1 >= func_count || !func_table) {
-                fprintf(stderr, "[VM] bad func idx %u at 0x%04X\n", src1, pc);
+                print_vm_error("[VM] bad func idx %u at 0x%04X\n", src1, pc);
                 goto cleanup;
             }
-            void *func = func_table[src1];
+            void (*func)(void) = func_table[src1];
 
             if (flg & VM_CALL_ARG_MIX) {
                 // ── Mixed int+fp args: use libffi ──
@@ -441,7 +440,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
                     st = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, arg_count,
                                       rtype, arg_types);
                 if (st != FFI_OK) {
-                    fprintf(stderr, "[VM] ffi_prep_cif%s failed at 0x%04X\n",
+                    print_vm_error("[VM] ffi_prep_cif%s failed at 0x%04X\n",
                             (fixed_count < arg_count) ? "_var" : "", pc);
                     goto cleanup;
                 }
@@ -489,12 +488,12 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             retval = (void *)(uintptr_t)ctx.r[dst];
             goto cleanup;
         default:
-            fprintf(stderr, "[VM] bad op 0x%02X at 0x%04X\n", op, pc);
+            print_vm_error("[VM] bad op 0x%02X at 0x%04X\n", op, pc);
             goto cleanup;
         }
         pc += 8;
     }
-    fprintf(stderr, "[VM] no RET found\n");
+    print_vm_error("[VM] no RET found\n");
 cleanup:
     {
         VMMemBlock *blk = ctx.blocks;

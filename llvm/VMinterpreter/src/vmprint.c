@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include "vminterpreter.h"
 
 // Define VM_SILENT before including this file to disable ALL output
@@ -115,4 +116,15 @@ void print_store_mem(uintptr_t addr, uintptr_t val) {
 
 void print_vm_ret(uintptr_t val) {
     PRINTF("[VM] return: %zu (0x%zX)\n", val, val);
+}
+
+void print_vm_error(const char *fmt, ...) {
+#ifdef VM_SILENT
+    (void)fmt;
+#else
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+#endif
 }

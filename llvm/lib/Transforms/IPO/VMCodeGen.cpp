@@ -1005,8 +1005,30 @@ static void insertVmpcall(Function *F) {
       CastArg = B.CreateIntToPtr(&Arg, Int8PtrTy);
     else if (Arg.getType()->isPointerTy())
       CastArg = B.CreateBitCast(&Arg, Int8PtrTy);
-    else
+    else if (Arg.getType()->isFloatingPointTy()) {
+      Type *ArgTy = Arg.getType();
+      if (ArgTy->isDoubleTy()) {
+        // double (64-bit): bitcast to i64, then inttoptr to i8*
+        Value *Bits = B.CreateBitCast(&Arg, IntPtrTy);
+        CastArg = B.CreateIntToPtr(Bits, Int8PtrTy);
+      } else if (ArgTy->isFloatTy()) {
+        // float (32-bit): bitcast to i32, zero-extend to i64, then inttoptr
+        Value *Bits32 = B.CreateBitCast(&Arg, Int32Ty);
+        Value *Bits64 = B.CreateZExt(Bits32, IntPtrTy);
+        CastArg = B.CreateIntToPtr(Bits64, Int8PtrTy);
+      } else {
+        // Other FP types (half/bfloat/etc.): preserve bit pattern through same-width integer
+        unsigned BitWidth = ArgTy->getPrimitiveSizeInBits();
+        Type *IntTy = Type::getIntNTy(Ctx, BitWidth);
+        Value *Bits = B.CreateBitCast(&Arg, IntTy);
+        if (BitWidth < (unsigned)IntPtrTy->getIntegerBitWidth())
+          Bits = B.CreateZExt(Bits, IntPtrTy);
+        CastArg = B.CreateIntToPtr(Bits, Int8PtrTy);
+      }
+    } else {
+      // Unsupported type — fall back to NULL
       CastArg = Constant::getNullValue(Int8PtrTy);
+    }
     RegArgs[ArgIdx++] = CastArg;
   }
   while (ArgIdx < 8)

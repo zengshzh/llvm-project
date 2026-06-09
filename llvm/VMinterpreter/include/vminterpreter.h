@@ -79,6 +79,7 @@ void print_vm_header(uint32_t size, uint32_t nregs);
 void print_vmsave(const uintptr_t gpr[8]);
 void print_store_mem(uintptr_t addr, uintptr_t val);
 void print_vm_ret(uintptr_t val);
+void print_vm_error(const char *fmt, ...);
 void *VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs,
                 void (**func_table)(void), uint32_t func_count,
                 const uintptr_t *global_init, uint32_t num_globals);

@@ -428,6 +428,18 @@ VMExecute(bytecode, size, nregs, func_table, func_count,
 - `VMExecute` 开始解释执行 bytecode，第三参数 `nregs` 指示 VM 上下文需要分配的寄存器数量（**r0–r(nregs-1)**，由 CodeGen 的 Use-count 回收算法计算的最大并发寄存器数）
 - 全局变量通过 `{reg, value}` 对表传递：`global_init` 交替存放 `[reg0, val0, reg1, val1, ...]`，VM 启动时遍历此表将 `value` 写入 `ctx.r[reg]`
 
+### 浮点参数捕获
+
+`VMSaveReg` 的参数类型为 `void*`（映射到通用寄存器），但 CodeGen 在生成 LLVM IR 时会对浮点参数做以下转换以保留 IEEE 754 位模式：
+
+| 参数类型 | 转换方式 |
+|---------|---------|
+| `int` / `ptr` | `inttoptr` 或 `bitcast` → `i8*`（不变） |
+| `double` | `bitcast double → i64` → `inttoptr → i8*` |
+| `float` | `bitcast float → i32` → `zext → i64` → `inttoptr → i8*` |
+
+编译器在调用 `VMSaveReg` 时会自动生成 `movq xmmN, rdi` 等指令，将浮点值的位模式从 XMM 寄存器复制到 GP 寄存器。VM 寄存器宽度为 `uintptr_t`（64 位），足以容纳 `double` 的全部 8 字节。后续字节码通过 `LOAD.8`/`STORE.8` 将位模式写入内存，再通过 `double*` 指针解引用还原为浮点值，或在 `SETARG` 中直接以 `uintptr_t` 形式传递给 libffi。
+
 ### 全局变量支持
 
 当 VMP 函数引用全局变量时，VMCodeGen 自动执行以下步骤：
