@@ -961,28 +961,28 @@ static void insertVmpcall(Function *F) {
   } else {
     FnTableGV = Constant::getNullValue(Int8PtrTy);
   }
+  const DataLayout &DL = M->getDataLayout();
+  Type *IntPtrTy = DL.getIntPtrType(Ctx);
+  Type *RetTy = F->getReturnType();
   Constant *FuncCountC = ConstantInt::get(Int32Ty, FuncCount);
 
-  // Declare: void *VMExecute(ptr, i32, i32, ptr, i32, ptr, i32)
+  // Declare: i64 VMExecute(ptr, i32, i32, ptr, i32, ptr, i32)
   // The last two parameters are (global_init[], num_globals).
+  // Returns uintptr_t — caller casts/bitcasts to actual return type.
   FunctionType *ExecFnTy = FunctionType::get(
-      Int8PtrTy,
+      IntPtrTy,
       {Int8PtrTy, Int32Ty, Int32Ty, Int8PtrTy, Int32Ty, Int8PtrTy, Int32Ty},
       false);
   FunctionCallee VmExec = M->getOrInsertFunction("VMExecute", ExecFnTy);
 
-  // Declare: void VMSaveReg(ptr, ptr, ..., ptr)  — 8 register values
-  SmallVector<Type *, 8> EightPtrs(8, Int8PtrTy);
+
+  SmallVector<Type *, 8> EightPtrs(8, IntPtrTy);
   FunctionType *SaveFnTy = FunctionType::get(
       Type::getVoidTy(Ctx), EightPtrs, false);
   FunctionCallee VmSave = M->getOrInsertFunction("VMSaveReg", SaveFnTy);
 
   // --- Replace function body with VMSaveReg + VMExecute + return ---
 
-  // Get return type and pointer-sized integer type for casting
-  Type *RetTy = F->getReturnType();
-  const DataLayout &DL = M->getDataLayout();
-  Type *IntPtrTy = DL.getIntPtrType(Ctx);
 
   // Remove all existing basic blocks
   for (auto &BB : make_early_inc_range(*F)) {
@@ -1002,20 +1002,20 @@ static void insertVmpcall(Function *F) {
       break;
     Value *CastArg = &Arg;
     if (Arg.getType()->isIntegerTy())
-      CastArg = B.CreateIntToPtr(&Arg, Int8PtrTy);
+      CastArg = B.CreateZExt(&Arg, IntPtrTy);
     else if (Arg.getType()->isPointerTy())
-      CastArg = B.CreateBitCast(&Arg, Int8PtrTy);
+      CastArg = B.CreatePtrToInt(&Arg, IntPtrTy);
     else if (Arg.getType()->isFloatingPointTy()) {
       Type *ArgTy = Arg.getType();
       if (ArgTy->isDoubleTy()) {
-        // double (64-bit): bitcast to i64, then inttoptr to i8*
+        // double (64-bit): bitcast to i64
         Value *Bits = B.CreateBitCast(&Arg, IntPtrTy);
-        CastArg = B.CreateIntToPtr(Bits, Int8PtrTy);
+        CastArg = Bits;
       } else if (ArgTy->isFloatTy()) {
-        // float (32-bit): bitcast to i32, zero-extend to i64, then inttoptr
+        // float (32-bit): bitcast to i32, zero-extend to i64
         Value *Bits32 = B.CreateBitCast(&Arg, Int32Ty);
         Value *Bits64 = B.CreateZExt(Bits32, IntPtrTy);
-        CastArg = B.CreateIntToPtr(Bits64, Int8PtrTy);
+        CastArg = Bits64;
       } else {
         // Other FP types (half/bfloat/etc.): preserve bit pattern through same-width integer
         unsigned BitWidth = ArgTy->getPrimitiveSizeInBits();
@@ -1023,16 +1023,16 @@ static void insertVmpcall(Function *F) {
         Value *Bits = B.CreateBitCast(&Arg, IntTy);
         if (BitWidth < (unsigned)IntPtrTy->getIntegerBitWidth())
           Bits = B.CreateZExt(Bits, IntPtrTy);
-        CastArg = B.CreateIntToPtr(Bits, Int8PtrTy);
+        CastArg = Bits;
       }
     } else {
-      // Unsupported type — fall back to NULL
-      CastArg = Constant::getNullValue(Int8PtrTy);
+      // Unsupported type — fall back to 0
+      CastArg = ConstantInt::get(IntPtrTy, 0);
     }
     RegArgs[ArgIdx++] = CastArg;
   }
   while (ArgIdx < 8)
-    RegArgs[ArgIdx++] = Constant::getNullValue(Int8PtrTy);
+    RegArgs[ArgIdx++] = ConstantInt::get(IntPtrTy, 0);
 
   B.CreateCall(VmSave, RegArgs);
 
@@ -1063,19 +1063,24 @@ static void insertVmpcall(Function *F) {
   CallInst *Result = B.CreateCall(VmExec,
       {BCPtr, Size, NRegs, FnTableGV, FuncCountC, GlobalInit, NumGlobals});
 
-  // 3) Cast and return
+  // 3) Cast and return — Result is IntPtrTy (uintptr_t)
   if (RetTy->isVoidTy()) {
     B.CreateRetVoid();
   } else if (RetTy->isPointerTy()) {
-    B.CreateRet(B.CreateBitCast(Result, RetTy));
+    B.CreateRet(B.CreateIntToPtr(Result, RetTy));
   } else if (RetTy->isIntegerTy()) {
-    Value *V = B.CreatePtrToInt(Result, IntPtrTy);
+    Value *V = Result;
     if (IntPtrTy != RetTy)
       V = B.CreateTrunc(V, RetTy);
     B.CreateRet(V);
   } else {
-    // For other types (float, etc.), go through intptr_t then bitcast
-    Value *V = B.CreatePtrToInt(Result, IntPtrTy);
+    // Float/double: trunc if needed → bitcast back to FP type
+    Value *V = Result;
+    unsigned RetBits = RetTy->getPrimitiveSizeInBits();
+    if (RetBits < (unsigned)IntPtrTy->getIntegerBitWidth()) {
+      Type *IntTy = Type::getIntNTy(Ctx, RetBits);
+      V = B.CreateTrunc(V, IntTy);
+    }
     B.CreateRet(B.CreateBitCast(V, RetTy));
   }
 }

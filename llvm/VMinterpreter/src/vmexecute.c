@@ -9,16 +9,16 @@
 // Saved register values from VMSaveReg, consumed by VMExecute
 static uintptr_t gpr[8];
 
-void VMSaveReg(void *r0, void *r1, void *r2, void *r3,
-               void *r4, void *r5, void *r6, void *r7) {
-    gpr[0] = (uintptr_t)r0;
-    gpr[1] = (uintptr_t)r1;
-    gpr[2] = (uintptr_t)r2;
-    gpr[3] = (uintptr_t)r3;
-    gpr[4] = (uintptr_t)r4;
-    gpr[5] = (uintptr_t)r5;
-    gpr[6] = (uintptr_t)r6;
-    gpr[7] = (uintptr_t)r7;
+void VMSaveReg(uintptr_t r0, uintptr_t r1, uintptr_t r2, uintptr_t r3,
+               uintptr_t r4, uintptr_t r5, uintptr_t r6, uintptr_t r7) {
+    gpr[0] = r0;
+    gpr[1] = r1;
+    gpr[2] = r2;
+    gpr[3] = r3;
+    gpr[4] = r4;
+    gpr[5] = r5;
+    gpr[6] = r6;
+    gpr[7] = r7;
     print_vmsave(gpr);
 }
 
@@ -70,7 +70,7 @@ typedef double (*FPVMCallFn)(double, double, double, double,
 #define ARGS8(a)  a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]
 
 // ---- execution engine ----
-void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
+uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
                 void (**func_table)(void), uint32_t func_count,
                 const uintptr_t *global_init, uint32_t num_globals) {
     hexdump(bc, size);
@@ -110,7 +110,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             ctx.r[r] = global_init[i + 1];
     }
 
-    void *retval = NULL;
+    uintptr_t retval = 0;
 
     for (uint32_t pc = 0; pc + 8 <= size; ) {
         uint8_t  op   = bc[pc];
@@ -485,7 +485,7 @@ void *VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
         }
         case VM_RET:
             print_vm_ret(ctx.r[dst]);
-            retval = (void *)(uintptr_t)ctx.r[dst];
+            retval = ctx.r[dst];
             goto cleanup;
         default:
             print_vm_error("[VM] bad op 0x%02X at 0x%04X\n", op, pc);

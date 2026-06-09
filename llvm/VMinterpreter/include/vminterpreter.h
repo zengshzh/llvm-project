@@ -80,10 +80,10 @@ void print_vmsave(const uintptr_t gpr[8]);
 void print_store_mem(uintptr_t addr, uintptr_t val);
 void print_vm_ret(uintptr_t val);
 void print_vm_error(const char *fmt, ...);
-void *VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs,
+uintptr_t VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs,
                 void (**func_table)(void), uint32_t func_count,
                 const uintptr_t *global_init, uint32_t num_globals);
-void VMSaveReg(void *r0, void *r1, void *r2, void *r3,
-               void *r4, void *r5, void *r6, void *r7);
+void VMSaveReg(uintptr_t r0, uintptr_t r1, uintptr_t r2, uintptr_t r3,
+               uintptr_t r4, uintptr_t r5, uintptr_t r6, uintptr_t r7);
 
 #endif

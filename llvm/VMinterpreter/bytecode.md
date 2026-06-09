@@ -421,7 +421,7 @@ VMSaveReg(r0, r1, ..., r7);           // 捕获 8 个函数参数作为 VM 寄�
 // [可选] 全局变量地址表（函数涉及全局变量时插入）
 // VMExecute 根据此表将全局变量地址填入对应的 VM 寄存器
 VMExecute(bytecode, size, nregs, func_table, func_count,
-          global_init, num_globals);  // 执行 bytecode，返回 void*
+          global_init, num_globals);  // 执行 bytecode，返回 uintptr_t
 ```
 
 - `VMSaveReg` 将函数参数的运行时值存入 VM 寄存器供 bytecode 使用
@@ -430,15 +430,33 @@ VMExecute(bytecode, size, nregs, func_table, func_count,
 
 ### 浮点参数捕获
 
-`VMSaveReg` 的参数类型为 `void*`（映射到通用寄存器），但 CodeGen 在生成 LLVM IR 时会对浮点参数做以下转换以保留 IEEE 754 位模式：
+`VMSaveReg` 的参数类型为 `uintptr_t`（映射到通用寄存器），CodeGen 在生成 LLVM IR 时对不同类型的参数做以下转换以保留其值：
 
 | 参数类型 | 转换方式 |
 |---------|---------|
-| `int` / `ptr` | `inttoptr` 或 `bitcast` → `i8*`（不变） |
-| `double` | `bitcast double → i64` → `inttoptr → i8*` |
-| `float` | `bitcast float → i32` → `zext → i64` → `inttoptr → i8*` |
+| `int` | `zext → IntPtrTy`（零扩展到指针宽度） |
+| `ptr` | `ptrtoint → IntPtrTy` |
+| `double` | `bitcast double → IntPtrTy`（保留 IEEE 754 位模式） |
+| `float` | `bitcast float → i32` → `zext → IntPtrTy` |
 
-编译器在调用 `VMSaveReg` 时会自动生成 `movq xmmN, rdi` 等指令，将浮点值的位模式从 XMM 寄存器复制到 GP 寄存器。VM 寄存器宽度为 `uintptr_t`（64 位），足以容纳 `double` 的全部 8 字节。后续字节码通过 `LOAD.8`/`STORE.8` 将位模式写入内存，再通过 `double*` 指针解引用还原为浮点值，或在 `SETARG` 中直接以 `uintptr_t` 形式传递给 libffi。
+编译器在调用 `VMSaveReg` 时会将浮点值的位模式从 XMM 寄存器搬到 GP 寄存器（`movq %xmmN, %rdi`），作为 `uintptr_t` 参数传入。VM 寄存器宽度为 `uintptr_t`（64 位），足以容纳 `double` 的全部 8 字节。后续字节码通过 `LOAD.8`/`STORE.8` 将位模式写入内存，再通过 `double*` 指针解引用还原为浮点值，或在 `SETARG` 中直接以 `uintptr_t` 形式传递给 libffi。
+
+### 浮点返回值
+
+被加固函数的浮点返回值（`float`/`double`）经过以下链路传递回调用方：
+
+1. **VM 侧**：`RET rval` 直接将 `ctx.r[dst]`（`uintptr_t`，内含 IEEE 754 位模式）返回
+2. **LLVM IR 侧**：`insertVmpcall()` 将 `VMExecute` 返回的 `uintptr_t`（IntPtrTy）通过以下步骤还原：
+   - 若目标浮点类型宽度 < 64 位（如 `float`），则 `trunc → i32`
+   - `bitcast` 回目标浮点类型（`i64 → double` 或 `i32 → float`）
+   - `ret double` / `ret float`：LLVM 按 x86-64 ABI 将值放入 XMM0
+
+生成的 LLVM IR 示意（`double` 返回）：
+```llvm
+%result = call i64 @VMExecute(...)    ; 返回 uintptr_t, 内含 double 位模式
+%ret    = bitcast i64 %result to double ; 按位重解释为 double
+ret double %ret                       ; → XMM0
+```
 
 ### 全局变量支持
 
