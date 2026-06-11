@@ -271,6 +271,7 @@ ADD  rtmp, r_input, r_i    ; rtmp = input + i * 1
   | 0 | `VM_CALL_RET_FP` | 返回类型：0=RAX（整数/指针），1=XMM0（浮点） |
   | 1 | `VM_CALL_ARG_FP` | 参数全为浮点 → `FPVMCallFn` |
   | 2 | `VM_CALL_ARG_MIX` | 参数混合整数+浮点 → libffi |
+  | 3 | `VM_CALL_INVOKE` | 此 CALL 来自 invoke，用 try/catch 包裹以捕获 C++ 异常 |
 
 - **6 种分派路径**（4 种函数指针 + libffi）：
 
@@ -309,6 +310,22 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 - **可变参数**：调用 `ffi_prep_cif_var`，区分固定参数与可变参数部分，libffi 自动处理各平台的可变参数传递规则（如 Win64 中可变浮点参数走整数寄存器/栈）
 
 参数通过 `SETARG` 预先设置到 `call_args[0..7]`（整数槽）和 `call_args_fp[0..7]`（浮点槽），libffi 从对应的数组中读取每个参数的值。
+
+**INVOKE_PREP** (0x0C)
+- 编码: `[0x0C][0][unwind_pc_lo(2)][unwind_pc_hi(2)][0]`
+- 设置异常跳转目标：`ctx.unwind_pc = dst | ((uint32_t)src1 << 16)`
+- 紧随其后是 `SETARG` + `CALL`（带上 `VM_CALL_INVOKE` 标志），若外部调用抛出 C++ 异常，VM 捕获后将 PC 跳转到 `unwind_pc` 执行 landingpad 清理链
+- `dst` + `src1` 组成 32 位绝对字节码偏移量，由 CodeGen Phase 3 回填
+
+**LPAD** (0x0D)
+- 编码: `[0x0D][0][dst(2)][0][0]`
+- 将 `ctx.exc`（`std::exception_ptr`，被捕获的异常）序列化为 `uintptr_t` 写入 `ctx.r[dst]`
+- selector（`{ptr, i32}` 的第二个字段）对于 cleanup-only landingpad 恒为 0，由后续 `extractvalue index=1 → LI 0` 处理
+
+**RESUME** (0x0E)
+- 编码: `[0x0E][0][0][exc_reg(2)][0]`
+- 从 `ctx.r[src1]` 反序列化 `std::exception_ptr`，调用 `std::rethrow_exception()` 重新抛出异常
+- 若异常句柄为空（不应发生），报错并终止 VM
 
 **RET** (0xFF)
 - 编码: `[0xFF][flags(0)][rval(2)][0][0]`
@@ -350,8 +367,14 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 | `switch val, default, [c1→bb1, ...]` | `LI #c; CMP; BR` 链 + phi 降级 |
 | `getelementptr` | 普通基址：常量偏移→`ADD rdst, rbase, #imm`；变量偏移→`MOV rtmp, rbase` + … |
 | | 全局变量基址：`MOV rdst, r_global`（被零偏移 GEP 优化掉时通过 CALL 参数直接引用）|
+| `invoke` | `INVOKE_PREP + SETARG + CALL` (flags bit3=1 表示 invoke)，正常目标 fall-through 或 `JMP` |
+| `landingpad` | `LPAD rdst`（存储序列化的 `std::exception_ptr`） |
+| `resume` | `RESUME rexc`（反序列化 `std::exception_ptr` 并 `std::rethrow_exception`） |
+| `extractvalue {ptr,i32}, 0` | `MOV rdst, ragg`（提取异常指针） |
+| `extractvalue {ptr,i32}, 1` | `LI rdst, 0`（cleanup-only selector 恒为 0） |
+| `insertvalue {ptr,i32}, val, idx` | `MOV rdst, rval`（传播异常句柄；仅支持 cleanup-only 模式） |
 
-**总进度： 9/10 类指令已支持（`█████████░`）**
+**总进度： 10/10 类指令已支持（`██████████`）**
 
 ### 分类进度
 
@@ -362,11 +385,11 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 | 整数移位 | ✅ ✅ ✅ | shl, lshr, ashr |
 | 整数位运算 | ✅ ✅ ✅ | and, or, xor |
 | 浮点算术 | ✅ ✅ ✅ ✅ ❌ | fadd, fsub, fmul, fdiv 使用专用浮点 ALU；frem 暂不支持 |
-| 控制流 | ✅ ✅ ❌ ❌ ❌ | br (无条件/条件), phi (MOV 降级) ✅ / switch, select, indirectbr 等 ✗ |
+| 控制流 | ✅ ✅ ✅ ❌ ❌ | br (无条件/条件), phi (MOV 降级), invoke ✅ / switch, select, indirectbr 等 ✗ |
 | 比较 | ✅ ✅ | icmp, fcmp |
 | 类型转换 | ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ ✅ | sitofp, fptosi, fptrunc, fpext, sext, zext, trunc, uitofp, fptoui 全部支持 |
-| 聚合操作 | ❌ ❌ ❌ ❌ ❌ | extractvalue, insertvalue, 向量操作 |
-| 函数调用 | ✅ ✅ ✅ | call (SETARG+CALL: 纯整数/浮点→函数指针, 混合→libffi) |
+| 聚合操作 | 🟡 ❌ ❌ ❌ ❌ | extractvalue/insertvalue (仅 cleanup-only exception 路径) / 向量操作 |
+| 函数调用 | ✅ ✅ ✅ | call (SETARG+CALL) + invoke (INVOKE_PREP+SETARG+CALL+try/catch) |
 
 ## 未支持的 IR 指令
 
@@ -378,7 +401,24 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 |---------|------|------|
 | `select` | 条件选择 | 待实现 |
 | `indirectbr` | 间接跳转 | 较少见 |
-| `invoke` / `resume` / `landingpad` | 异常处理 | 复杂，暂不考虑 |
+
+### 异常处理（部分支持）
+
+| IR 指令 | 支持状态 | 说明 |
+|---------|---------|------|
+| `invoke` | ✅ 已支持 | 翻译为 `INVOKE_PREP + SETARG + CALL` (VM_CALL_INVOKE 标志)，VM 用 try/catch 包裹调用。仅支持直接调用路径（纯 int/fp 参数）；libffi 混合参数路径的异常可能无法被捕获。 |
+| `landingpad` | 🟡 部分支持 | 仅支持 `cleanup` 类型（无 catch 子句）。`catch` 类型需要集成 `__cxa_begin_catch` / RTTI 类型匹配，暂不支持。 |
+| `resume` | ✅ 已支持 | 翻译为 `VM_RESUME`，调用 `std::rethrow_exception()` 重新抛出异常。 |
+
+### 聚合操作（部分支持）
+
+| IR 指令 | 支持状态 | 说明 |
+|---------|---------|------|
+| `extractvalue` | 🟡 部分支持 | 仅支持来自 landingpad 的 `{ptr, i32}` 聚合值。index 0 → `VM_MOV` 提取异常指针，index 1 → `VM_LI 0`（cleanup-only selector）。 |
+| `insertvalue` | 🟡 部分支持 | 仅支持 resume 前的 `{ptr, i32}` 组合，通过 `VM_MOV` 传播异常句柄。 |
+| `extractelement` | ❌ | 向量取值 |
+| `insertelement` | ❌ | 向量设值 |
+| `shufflevector` | ❌ | 向量重排 |
 
 ### 类型转换
 
@@ -406,11 +446,80 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 
 | IR 指令 | 说明 |
 |---------|------|
-| `extractvalue` | 从聚合类型取值 |
-| `insertvalue` | 设置聚合类型字段 |
 | `extractelement` | 向量取值 |
 | `insertelement` | 向量设值 |
 | `shufflevector` | 向量重排 |
+
+> 注：`extractvalue` / `insertvalue` 已在异常处理路径中部分支持（见上方[异常处理（部分支持）](#异常处理部分支持)）。
+
+## 异常处理算法
+
+### 概述
+
+VM 支持 C++ 异常处理的基本流程（invoke → landingpad cleanup → resume）。核心思路是将 `invoke` 翻译为带 try/catch 包裹的 `CALL`，异常被 VM 捕获后跳转到 landingpad 块执行清理代码，最后通过 resume 重新抛出。
+
+### 字节码序列
+
+对于一个典型的 `invoke` 调用：
+
+```llvm
+invoke void @may_throw_fn(args...) to label %normal unwind label %lpad
+```
+
+CodeGen 生成以下字节码序列：
+
+```
+INVOKE_PREP <unwind_pc>     ; 设置 ctx.unwind_pc = landingpad 块起始偏移
+SETARG r0, arg0             ; 与普通 CALL 相同的参数设置
+SETARG r1, arg1
+...
+CALL [fn_idx] (inv flag=1)  ; CALL 带上 VM_CALL_INVOKE (bit 3) 标志
+; -- 正常返回路径 (fall-through 到 normal 块) --
+; -- 若 normal 不是下一块，此处插入 JMP --
+```
+
+### VM 执行流程
+
+```
+1. INVOKE_PREP: ctx.unwind_pc = absolute_offset(lpad_bb)
+
+2. SETARG * N: 设置调用参数（同普通 CALL）
+
+3. CALL (inv flag=1):
+   try {
+       fn(args...);        // 直接函数指针调用（非 libffi 路径）
+       // 正常返回：pc += 8，继续执行 normal 块
+   } catch (...) {
+       ctx.exc = std::current_exception();  // 保存异常
+       pc = ctx.unwind_pc;                  // 跳转到 landingpad
+   }
+
+4. LPAD rdst:
+   ctx.r[rdst] = serialize(std::exception_ptr → uintptr_t)
+
+5. extractvalue 0 → MOV rdst, ragg:
+   提取异常指针（序列化的 std::exception_ptr）到新寄存器
+
+6. extractvalue 1 → LI rdst, 0:
+   cleanup-only selector 恒为 0
+
+7. [清理代码]：析构函数调用（普通 CALL 指令）
+
+8. insertvalue {ptr,i32}:
+   MOV rdst, rval — 传播异常句柄到 resume 操作数
+
+9. RESUME rexc:
+   从 ctx.r[src1] 反序列化 std::exception_ptr
+   std::rethrow_exception(ep) — 重新抛出异常到上层调用者
+```
+
+### 限制
+
+1. **仅支持 cleanup-only landingpad**：当前实现仅处理 `landingpad {ptr, i32} cleanup` 模式（无 catch 子句）。带有 catch 的 landingpad 需要 RTTI 类型匹配和 `__cxa_begin_catch` / `__cxa_end_catch` 集成，暂不支持。
+
+2. **libffi 混合参数路径**：`VM_CALL_ARG_MIX`（libffi）路径的 try/catch 可能无法捕获 C++ 异常，因为 libffi 的汇编 trampoline 不保证异常传播。直接函数指针调用路径（`VM_CALL_ARG_FP` / 纯 int）可以正常工作。
+
+3. **VM 解释器改用 C++ 编译**：`vmexecute.c` 已改为 `vmexecute.cpp`，需要 C++ 编译器（支持 `<exception>` 和 `std::exception_ptr`）。VMContext 结构体新增 `std::exception_ptr exc` 和 `uint32_t unwind_pc` 字段。
 
 ## Runtime Interface
 

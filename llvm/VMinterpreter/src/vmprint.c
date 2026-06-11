@@ -73,9 +73,14 @@ void print_insn(const uint8_t *bc, uint32_t off) {
     case VM_JMP:   PRINTF("  0x%04X: JMP    #%+d\n",          off, (int16_t)src1); break;
     case VM_BR:    PRINTF("  0x%04X: BR%s    r%u, #%+d\n",    off, (flg & VM_FLAG_BR_NT)?"!":"", src1, (int16_t)src2); break;
     case VM_SETARG: PRINTF("  0x%04X: SETARG%s r%u, r%u\n", off, (flg & 1)?"fp ":"   ", dst, src1); break;
-    case VM_CALL:  PRINTF("  0x%04X: CALL%s%s r%u, [%u]\n", off,
+    case VM_CALL:  PRINTF("  0x%04X: CALL%s%s%s r%u, [%u]\n", off,
         (flg & VM_CALL_ARG_MIX)?"mx":(flg & VM_CALL_ARG_FP)?"fp":"  ",
-        (flg & VM_CALL_RET_FP)?"r":" ", dst, src1); break;
+        (flg & VM_CALL_RET_FP)?"r":" ",
+        (flg & VM_CALL_INVOKE)?" inv":"", dst, src1); break;
+    case VM_INVOKE_PREP: PRINTF("  0x%04X: INVOKE_PREP unwind=%u\n", off,
+        dst | ((uint32_t)src1 << 16)); break;
+    case VM_LPAD:  PRINTF("  0x%04X: LPAD   r%u  \n",         off, dst); break;
+    case VM_RESUME: PRINTF("  0x%04X: RESUME r%u\n",           off, src1); break;
     case VM_RET:   PRINTF("  0x%04X: RET    r%u\n",           off, dst); break;
     default:       PRINTF("  0x%04X: ???    (op=%02X)\n",      off, op); break;
     }

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <math.h>
+#include <exception>
 #include <ffi.h>
 #include "vminterpreter.h"
 
@@ -40,6 +41,8 @@ typedef struct {
     void      *call_args[8];      // integer/pointer arg slots
     double     call_args_fp[8];   // float/double arg slots
     double     ret_fp;            // float/double return value
+    std::exception_ptr exc;       // caught exception for invoke/unwind
+    uint32_t   unwind_pc;         // bytecode offset to unwind target
 } VMContext;
 
 // ---- helper: resolve src2 (register or immediate) �?returns 0 on success ----
@@ -76,10 +79,9 @@ uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
     hexdump(bc, size);
     print_vm_header(size, nregs);
 
-    VMContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
+    VMContext ctx{};
     ctx.nregs = nregs;
-    ctx.r = calloc(nregs, sizeof(uintptr_t));
+    ctx.r = (uintptr_t *)calloc(nregs, sizeof(uintptr_t));
 
     // Pre-scan bytecode for fixed-size ALLOCAs, sum them up so we allocate
     // exactly once — no realloc needed (it would invalidate returned pointers).
@@ -94,7 +96,7 @@ uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
       }
       if (need) {
         ctx.mcap = need;
-        ctx.m = calloc(1, need);
+        ctx.m = (uint8_t *)calloc(1, need);
       }
     }
 
@@ -122,13 +124,20 @@ uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
         print_insn(bc, pc);
 
         // Special instructions that don't use standard register fields
-        if (op == VM_JMP || op == VM_BR || op == VM_SETARG || op == VM_CALL) {
+        if (op == VM_JMP || op == VM_BR || op == VM_SETARG || op == VM_CALL ||
+            op == VM_INVOKE_PREP || op == VM_LPAD || op == VM_RESUME) {
             // Bounds check only the register-referencing fields
             if (op == VM_SETARG && src1 > 0 && src1 >= ctx.nregs) {
                 print_vm_error("[VM] src1 bounds at 0x%04X\n", pc); goto cleanup;
             }
             if (op == VM_CALL && dst > 0 && dst >= ctx.nregs) {
                 print_vm_error("[VM] dst bounds at 0x%04X\n", pc); goto cleanup;
+            }
+            if (op == VM_LPAD && dst >= ctx.nregs) {
+                print_vm_error("[VM] dst bounds at 0x%04X\n", pc); goto cleanup;
+            }
+            if (op == VM_RESUME && src1 >= ctx.nregs) {
+                print_vm_error("[VM] src1 bounds at 0x%04X\n", pc); goto cleanup;
             }
         } else {
             if (dst >= ctx.nregs || src1 >= ctx.nregs) {
@@ -171,8 +180,8 @@ uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
             uint32_t alloc_size = (flg & 1) ? (uint32_t)ctx.r[src1] : src2;
             if (flg & 1) {
               // VLA: allocate an overflow block (can't live in main bump arena)
-              VMMemBlock *blk = calloc(1, sizeof(VMMemBlock));
-              blk->mem = calloc(1, alloc_size);
+              VMMemBlock *blk = (VMMemBlock *)calloc(1, sizeof(VMMemBlock));
+              blk->mem = (uint8_t *)calloc(1, alloc_size);
               blk->size = alloc_size;
               blk->next = ctx.blocks;
               ctx.blocks = blk;
@@ -406,6 +415,7 @@ uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
                 goto cleanup;
             }
             void (*func)(void) = func_table[src1];
+            bool is_invoke = (flg & VM_CALL_INVOKE) != 0;
 
             if (flg & VM_CALL_ARG_MIX) {
                 // ── Mixed int+fp args: use libffi ──
@@ -446,42 +456,188 @@ uintptr_t VMExecute(const uint8_t *bc, uint32_t size, uint32_t nregs,
                 }
 
                 if (flg & VM_CALL_RET_FP) {
-                    double result;
-                    ffi_call(&cif, FFI_FN(func), &result, arg_values);
-                    if (dst) memcpy(&ctx.r[dst], &result, sizeof(double));
+                    if (is_invoke) {
+                        try {
+                            double result;
+                            ffi_call(&cif, FFI_FN(func), &result, arg_values);
+                            if (dst) memcpy(&ctx.r[dst], &result, sizeof(double));
+                        } catch (...) {
+                            ctx.exc = std::current_exception();
+                            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+                            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+                            if (ctx.unwind_pc + 8 > size) {
+                                print_vm_error("[VM] unwind_pc 0x%X out of range "
+                                               "(size=0x%X) at 0x%04X\n",
+                                               ctx.unwind_pc, size, pc);
+                                goto cleanup;
+                            }
+                            pc = ctx.unwind_pc;
+                            continue;
+                        }
+                    } else {
+                        double result;
+                        ffi_call(&cif, FFI_FN(func), &result, arg_values);
+                        if (dst) memcpy(&ctx.r[dst], &result, sizeof(double));
+                    }
                 } else {
-                    uintptr_t result = 0;
-                    ffi_call(&cif, FFI_FN(func), &result, arg_values);
-                    if (dst) ctx.r[dst] = result;
+                    if (is_invoke) {
+                        try {
+                            uintptr_t result = 0;
+                            ffi_call(&cif, FFI_FN(func), &result, arg_values);
+                            if (dst) ctx.r[dst] = result;
+                        } catch (...) {
+                            ctx.exc = std::current_exception();
+                            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+                            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+                            if (ctx.unwind_pc + 8 > size) {
+                                print_vm_error("[VM] unwind_pc 0x%X out of range "
+                                               "(size=0x%X) at 0x%04X\n",
+                                               ctx.unwind_pc, size, pc);
+                                goto cleanup;
+                            }
+                            pc = ctx.unwind_pc;
+                            continue;
+                        }
+                    } else {
+                        uintptr_t result = 0;
+                        ffi_call(&cif, FFI_FN(func), &result, arg_values);
+                        if (dst) ctx.r[dst] = result;
+                    }
                 }
             } else if (flg & VM_CALL_ARG_FP) {
                 if (flg & VM_CALL_RET_FP) {
                     // Case 4: fp args + fp ret → FPVMCallFn (reads XMM0)
                     FPVMCallFn fn = (FPVMCallFn)func;
-                    double r = fn(ARGS8(ctx.call_args_fp));
-                    if (dst) memcpy(&ctx.r[dst], &r, 8);
+                    if (is_invoke) {
+                        try {
+                            double r = fn(ARGS8(ctx.call_args_fp));
+                            if (dst) memcpy(&ctx.r[dst], &r, 8);
+                        } catch (...) {
+                            ctx.exc = std::current_exception();
+                            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+                            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+                            if (ctx.unwind_pc + 8 > size) {
+                                print_vm_error("[VM] unwind_pc 0x%X out of range "
+                                               "(size=0x%X) at 0x%04X\n",
+                                               ctx.unwind_pc, size, pc);
+                                goto cleanup;
+                            }
+                            pc = ctx.unwind_pc;
+                            continue;
+                        }
+                    } else {
+                        double r = fn(ARGS8(ctx.call_args_fp));
+                        if (dst) memcpy(&ctx.r[dst], &r, 8);
+                    }
                 } else {
                     // Case 3: fp args + int ret → FPIntRetCallFn (reads RAX)
                     FPIntRetCallFn fn = (FPIntRetCallFn)func;
-                    ctx.r[dst] = fn(ARGS8(ctx.call_args_fp));
+                    if (is_invoke) {
+                        try {
+                            uintptr_t _ret = fn(ARGS8(ctx.call_args_fp));
+                            if (dst) ctx.r[dst] = _ret;
+                        } catch (...) {
+                            ctx.exc = std::current_exception();
+                            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+                            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+                            if (ctx.unwind_pc + 8 > size) {
+                                print_vm_error("[VM] unwind_pc 0x%X out of range "
+                                               "(size=0x%X) at 0x%04X\n",
+                                               ctx.unwind_pc, size, pc);
+                                goto cleanup;
+                            }
+                            pc = ctx.unwind_pc;
+                            continue;
+                        }
+                    } else {
+                        uintptr_t _ret = fn(ARGS8(ctx.call_args_fp));
+                        if (dst) ctx.r[dst] = _ret;
+                    }
                 }
             } else {
                 // ── Pure int args: use IntRetCallFn or DblRetCallFn (case 1-2) ──
                 if (flg & VM_CALL_RET_FP) {
                     // Case 2: int args + fp ret → DblRetCallFn (reads XMM0)
                     DblRetCallFn fn = (DblRetCallFn)func;
-                    double r = fn(ARGS8(ctx.call_args));
-                    if (dst) memcpy(&ctx.r[dst], &r, 8);
+                    if (is_invoke) {
+                        try {
+                            double r = fn(ARGS8(ctx.call_args));
+                            if (dst) memcpy(&ctx.r[dst], &r, 8);
+                        } catch (...) {
+                            ctx.exc = std::current_exception();
+                            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+                            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+                            if (ctx.unwind_pc + 8 > size) {
+                                print_vm_error("[VM] unwind_pc 0x%X out of range "
+                                               "(size=0x%X) at 0x%04X\n",
+                                               ctx.unwind_pc, size, pc);
+                                goto cleanup;
+                            }
+                            pc = ctx.unwind_pc;
+                            continue;
+                        }
+                    } else {
+                        double r = fn(ARGS8(ctx.call_args));
+                        if (dst) memcpy(&ctx.r[dst], &r, 8);
+                    }
                 } else {
                     // Case 1: int args + int ret → IntRetCallFn (reads RAX)
                     IntRetCallFn fn = (IntRetCallFn)func;
-                    ctx.r[dst] = fn(ARGS8(ctx.call_args));
+                    if (is_invoke) {
+                        try {
+                            uintptr_t _ret = fn(ARGS8(ctx.call_args));
+                            if (dst) ctx.r[dst] = _ret;
+                        } catch (...) {
+                            ctx.exc = std::current_exception();
+                            memset(ctx.call_args, 0, sizeof(ctx.call_args));
+                            memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
+                            if (ctx.unwind_pc + 8 > size) {
+                                print_vm_error("[VM] unwind_pc 0x%X out of range "
+                                               "(size=0x%X) at 0x%04X\n",
+                                               ctx.unwind_pc, size, pc);
+                                goto cleanup;
+                            }
+                            pc = ctx.unwind_pc;
+                            continue;
+                        }
+                    } else {
+                        uintptr_t _ret = fn(ARGS8(ctx.call_args));
+                        if (dst) ctx.r[dst] = _ret;
+                    }
                 }
             }
             memset(ctx.call_args, 0, sizeof(ctx.call_args));
             memset(ctx.call_args_fp, 0, sizeof(ctx.call_args_fp));
             if (dst) print_reg_result(dst, ctx.r[dst]);
             break;
+        }
+        case VM_INVOKE_PREP:
+            // dst | (src1 << 16) = 32-bit absolute bytecode offset of unwind target
+            ctx.unwind_pc = dst | ((uint32_t)src1 << 16);
+            break;
+        case VM_LPAD:
+            // Store the exception handle (serialized std::exception_ptr) in r[dst].
+            // The selector (=0 for cleanup) is handled in codegen by extractvalue
+            // emitting VM_LI 0, so we don't need r[dst+1].
+            if (ctx.exc) {
+                memcpy(&ctx.r[dst], (void *)&ctx.exc, sizeof(uintptr_t));
+            } else {
+                ctx.r[dst] = 0;
+            }
+            print_reg_result(dst, ctx.r[dst]);
+            break;
+        case VM_RESUME: {
+            // Deserialize exception_ptr from register and rethrow.
+            // The exception handle was stored by VM_LPAD and may have been
+            // propagated through MOV/STORE/LOAD instructions in the landingpad block.
+            std::exception_ptr ep;
+            memcpy((void *)&ep, &ctx.r[src1], sizeof(ep));
+            if (ep) {
+                std::rethrow_exception(ep);
+            }
+            // If no exception (should never happen), fall through to error
+            print_vm_error("[VM] RESUME with null exception at 0x%04X\n", pc);
+            goto cleanup;
         }
         case VM_RET:
             print_vm_ret(ctx.r[dst]);

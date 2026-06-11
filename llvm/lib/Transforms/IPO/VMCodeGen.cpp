@@ -318,6 +318,13 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
     bool IsBr;           // false=JMP (src1@+4), true=BR (src2@+6)
   };
   std::vector<BranchPatch> Patches;
+  // Invoke patches: VM_INVOKE_PREP has a placeholder 32-bit absolute offset
+  // that is filled with the unwind destination's bytecode offset in Phase 3.
+  struct InvokePatch {
+    unsigned InstrStart;    // BC.size() before emitInsn of VM_INVOKE_PREP
+    BasicBlock *Target;     // unwind destination BB
+  };
+  std::vector<InvokePatch> InvokePatches;
 
   const DataLayout &DL = F->getParent()->getDataLayout();
   for (auto &BB : *F) {
@@ -794,8 +801,12 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           emitInsn(BC, VM_JMP, 0, 0, 0);
           Patches.push_back({JmpStart, DefaultBB, false});
         }
-      } else if (auto *CI = dyn_cast<CallInst>(&I)) {
-        Function *Callee = CI->getCalledFunction();
+      } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+        // CallBrInst (asm goto) is not supported
+        if (isa<CallBrInst>(CB))
+          report_fatal_error("[VMCodeGen] CallBrInst (asm goto) not supported\n");
+
+        Function *Callee = CB->getCalledFunction();
         if (!Callee)
           report_fatal_error("[VMCodeGen] indirect calls not supported\n");
 
@@ -812,7 +823,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           continue;
         }
 
-        unsigned NArgs = CI->arg_size();
+        unsigned NArgs = CB->arg_size();
         auto It = FuncNameMap.find(Callee->getName());
         if (It == FuncNameMap.end()) {
           It = FuncNameMap.insert({Callee->getName(), FuncNames.size()}).first;
@@ -823,43 +834,16 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         bool AllInt = true, AllFP = true;
         uint16_t ArgMask = 0;  // bit i = 1 if arg i is float/double
         for (unsigned i = 0; i < NArgs && i < 8; i++) {
-          Type *T = CI->getArgOperand(i)->getType();
+          Type *T = CB->getArgOperand(i)->getType();
           if (T->isFloatTy() || T->isDoubleTy()) { AllInt = false; ArgMask |= (1 << i); }
           else AllFP = false;
         }
-        bool RetFP = CI->getType()->isFloatTy() || CI->getType()->isDoubleTy();
-
-        bool IsVarArg = Callee->isVarArg();
-        for (unsigned i = 0; i < NArgs && i < 8; i++) {
-          unsigned RArg;
-          Type *ArgTy = CI->getArgOperand(i)->getType();
-          bool IsFP = ArgTy->isFloatTy() || ArgTy->isDoubleTy();
-          uint8_t ArgFlags = IsFP ? 1 : 0;
-          if (auto *CInt = dyn_cast<ConstantInt>(CI->getArgOperand(i))) {
-            RArg = Regs.allocRaw();
-            emitInsn(BC, VM_LI, RArg, 0, static_cast<uint16_t>(CInt->getZExtValue()));
-          } else if (auto *CFP = dyn_cast<ConstantFP>(CI->getArgOperand(i))) {
-            RArg = Regs.allocRaw();
-            uint32_t Bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
-            emitInsn32(BC, VM_LI32, RArg, Bits);
-          } else if (auto *GV = dyn_cast<GlobalVariable>(
-                         CI->getArgOperand(i)->stripPointerCasts())) {
-            // LLVM may optimise away a zero-offset GEP and use the global
-            // variable directly.  Assign a global register for its address.
-            RArg = getGlobalReg(GV);
-          } else {
-            RArg = Regs.consume(CI->getArgOperand(i));
-          }
-          emitInsn(BC, VM_SETARG, i, RArg, 0, ArgFlags);
-          // Variadic functions need fp args in BOTH XMM and GP slots
-          if (IsVarArg && IsFP)
-            emitInsn(BC, VM_SETARG, i, RArg, 0, 0);  // also → call_args[i]
-        }
-        unsigned RetReg = CI->getType()->isVoidTy() ? 0 : Regs.alloc(&I);
+        bool RetFP = CB->getType()->isFloatTy() || CB->getType()->isDoubleTy();
         // Select CALL flags:
         //   bit 0: VM_CALL_RET_FP  — 1=fp return (XMM0)
         //   bit 1: VM_CALL_ARG_FP  — 1=all fp args (FPVMCallFn)
         //   bit 2: VM_CALL_ARG_MIX — 1=mixed int+fp args → libffi
+        //   bit 3: VM_CALL_INVOKE   — 1=invoke (try/catch wrap in VM)
         uint8_t CallFlags = (RetFP ? VM_CALL_RET_FP : 0);
         if (!AllInt && !AllFP) {
           CallFlags |= VM_CALL_ARG_MIX;
@@ -867,6 +851,43 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           CallFlags |= VM_CALL_ARG_FP;    // pure fp → FPVMCallFn
         }
         // else pure int → VMCallFn or DblRetCallFn (based on ret type)
+
+        // For invoke: emit VM_INVOKE_PREP to record unwind target offset.
+        // The actual absolute offset is patched in Phase 3.
+        if (auto *II = dyn_cast<InvokeInst>(CB)) {
+          unsigned InvokePrepStart = BC.size();
+          emitInsn(BC, VM_INVOKE_PREP, 0, 0, 0);
+          InvokePatches.push_back({InvokePrepStart, II->getUnwindDest()});
+          CallFlags |= VM_CALL_INVOKE;
+        }
+
+        bool IsVarArg = Callee->isVarArg();
+        for (unsigned i = 0; i < NArgs && i < 8; i++) {
+          unsigned RArg;
+          Type *ArgTy = CB->getArgOperand(i)->getType();
+          bool IsFP = ArgTy->isFloatTy() || ArgTy->isDoubleTy();
+          uint8_t ArgFlags = IsFP ? 1 : 0;
+          if (auto *CInt = dyn_cast<ConstantInt>(CB->getArgOperand(i))) {
+            RArg = Regs.allocRaw();
+            emitInsn(BC, VM_LI, RArg, 0, static_cast<uint16_t>(CInt->getZExtValue()));
+          } else if (auto *CFP = dyn_cast<ConstantFP>(CB->getArgOperand(i))) {
+            RArg = Regs.allocRaw();
+            uint32_t Bits = CFP->getValueAPF().bitcastToAPInt().getZExtValue();
+            emitInsn32(BC, VM_LI32, RArg, Bits);
+          } else if (auto *GV = dyn_cast<GlobalVariable>(
+                         CB->getArgOperand(i)->stripPointerCasts())) {
+            // LLVM may optimise away a zero-offset GEP and use the global
+            // variable directly.  Assign a global register for its address.
+            RArg = getGlobalReg(GV);
+          } else {
+            RArg = Regs.consume(CB->getArgOperand(i));
+          }
+          emitInsn(BC, VM_SETARG, i, RArg, 0, ArgFlags);
+          // Variadic functions need fp args in BOTH XMM and GP slots
+          if (IsVarArg && IsFP)
+            emitInsn(BC, VM_SETARG, i, RArg, 0, 0);  // also → call_args[i]
+        }
+        unsigned RetReg = CB->getType()->isVoidTy() ? 0 : Regs.alloc(&I);
         // Encode args info in bytes 6-7 for libffi (mixed mode):
         //   byte 6 low nibble  = arg_count (clamped to 8)
         //   byte 6 high nibble = fixed_arg_count (for variadic, else == arg_count)
@@ -877,6 +898,84 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         uint16_t ArgInfo = (ArgCount & 0x0F) | ((FixedCount & 0x0F) << 4)
                          | ((ArgMask & 0xFF) << 8);
         emitInsn(BC, VM_CALL, RetReg, FuncIdx, ArgInfo, CallFlags);
+
+        // Invoke-specific post-call handling:
+        //   - PHI lowering for the normal destination
+        //   - JMP to normal destination if not fall-through
+        if (auto *II = dyn_cast<InvokeInst>(CB)) {
+          BasicBlock *NormalDest = II->getNormalDest();
+          // --- PHI lowering (normal dest only; unwind path is dead) ---
+          for (auto &SI : *NormalDest) {
+            auto *PN = dyn_cast<PHINode>(&SI);
+            if (!PN) break;
+            Value *Incoming = PN->getIncomingValueForBlock(&BB);
+            unsigned RPhi = Regs.lookupReg(PN);
+            if (auto *CI = dyn_cast<ConstantInt>(Incoming)) {
+              emitInsn(BC, VM_LI, RPhi, 0,
+                       static_cast<uint16_t>(CI->getZExtValue()));
+            } else {
+              unsigned RVal = Regs.consume(Incoming);
+              emitInsn(BC, VM_MOV, RPhi, RVal, 0);
+            }
+          }
+          // --- JMP to normal dest if not next block in layout ---
+          if (BBOrder[NormalDest] != BBOrder[&BB] + 1) {
+            unsigned InstrStart = BC.size();
+            emitInsn(BC, VM_JMP, 0, 0, 0);
+            Patches.push_back({InstrStart, NormalDest, false});
+          }
+        }
+      } else if (isa<LandingPadInst>(&I)) {
+        // Landingpad produces a {ptr, i32} aggregate.  Allocate one register
+        // for the exception handle (VM_LPAD fills ctx.r[dst] with the
+        // serialized std::exception_ptr).  The selector (index 1) is always 0
+        // for cleanup landingpads and is handled by extractvalue → VM_LI 0.
+        // The unwind path is dead in normal execution; LPAD is only reached
+        // when an exception was caught by VM_CALL INVOKE.
+        unsigned RDst = Regs.alloc(&I);
+        emitInsn(BC, VM_LPAD, RDst, 0, 0);
+      } else if (auto *EVI = dyn_cast<ExtractValueInst>(&I)) {
+        // extractvalue from a {ptr, i32} aggregate (landingpad result).
+        // Index 0 = exception pointer, index 1 = selector (always 0 for cleanup).
+        Value *Agg = EVI->getAggregateOperand();
+        unsigned RDst = Regs.alloc(&I);
+        unsigned RAgg = Regs.consume(Agg);
+        auto Indices = EVI->getIndices();
+        if (Indices.size() == 1 && Indices[0] == 1) {
+          // Selector field: always 0 for cleanup-only landingpads.
+          emitInsn(BC, VM_LI, RDst, 0, 0);
+        } else {
+          // Exception pointer field (index 0): RAgg holds the serialized
+          // std::exception_ptr stored by VM_LPAD.
+          emitInsn(BC, VM_MOV, RDst, RAgg, 0);
+        }
+      } else if (auto *IVI = dyn_cast<InsertValueInst>(&I)) {
+        // insertvalue into a {ptr, i32} aggregate (used before resume).
+        // Propagate the exception handle from the source aggregate.
+        Value *Agg = IVI->getAggregateOperand();
+        Value *Val = IVI->getInsertedValueOperand();
+        unsigned RDst = Regs.alloc(&I);
+        // For index 0 (exception pointer): copy the inserted value.
+        // For index 1 (selector): copy the previous aggregate (which already
+        // has the exception pointer in its first field).
+        auto Indices = IVI->getIndices();
+        if (Indices.size() == 1 && Indices[0] == 0) {
+          // Insert exception pointer into a new aggregate (poison base).
+          unsigned RVal = Regs.consume(Val);
+          emitInsn(BC, VM_MOV, RDst, RVal, 0);
+        } else {
+          // Index 1: copy the aggregate from the previous insertvalue result.
+          unsigned RAgg = Regs.consume(Agg);
+          Regs.consume(Val);
+          emitInsn(BC, VM_MOV, RDst, RAgg, 0);
+        }
+      } else if (isa<ResumeInst>(&I)) {
+        // resume {ptr, i32}: rethrow the exception stored in the register.
+        // The operand is the aggregate value containing the serialized
+        // std::exception_ptr.  We just consume it and emit VM_RESUME.
+        Value *ExcVal = cast<ResumeInst>(&I)->getValue();
+        unsigned RExc = Regs.consume(ExcVal);
+        emitInsn(BC, VM_RESUME, 0, RExc, 0);
       } else {
         report_fatal_error(
             Twine("[VMCodeGen] unsupported instruction: ") +
@@ -894,6 +993,17 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
     unsigned Pos = P.IsBr ? P.InstrStart + 6 : P.InstrStart + 4;
     BC[Pos] = Enc & 0xFF;
     BC[Pos + 1] = (Enc >> 8) & 0xFF;
+  }
+
+  // --- Patch invoke unwind targets ---
+  for (auto &P : InvokePatches) {
+    uint32_t TargetOff = ActualBBOffset[P.Target];
+    // VM_INVOKE_PREP uses dst (bytes 2-3) and src1 (bytes 4-5) for the
+    // 32-bit absolute bytecode offset of the unwind destination.
+    BC[P.InstrStart + 2] = TargetOff & 0xFF;
+    BC[P.InstrStart + 3] = (TargetOff >> 8) & 0xFF;
+    BC[P.InstrStart + 4] = (TargetOff >> 16) & 0xFF;
+    BC[P.InstrStart + 5] = (TargetOff >> 24) & 0xFF;
   }
 
   // Global registers were already allocated via NextReg++ inside getGlobalReg,

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // VM bytecode opcodes
 // Memory:         0x00–0x0F
 // Integer arith:  0x10–0x1F
@@ -24,6 +28,9 @@ enum VM_Opcode {
   VM_BR     = 0x09,   // if rsrc1 != 0 then pc += (int16_t)src2
   VM_SETARG = 0x0A,   // ctx.call_args[dst] = ctx.r[src1]
   VM_CALL   = 0x0B,   // call func_table[src1], ret → rdst
+  VM_INVOKE_PREP = 0x0C, // set unwind_pc = dst | (src1 << 16) for next CALL
+  VM_LPAD   = 0x0D,   // landingpad: ctx.r[dst] = exception handle
+  VM_RESUME = 0x0E,   // rethrow exception from ctx.r[src1]
 
   // ── Integer arithmetic ──
   VM_ADD    = 0x10,
@@ -71,6 +78,7 @@ enum VM_Opcode {
 #define VM_CALL_RET_FP   1   // bit 0: 返回值在 XMM0（浮点），否则 RAX（整数）
 #define VM_CALL_ARG_FP   2   // bit 1: 参数全为浮点 → FPVMCallFn
 #define VM_CALL_ARG_MIX  4   // bit 2: 参数混合整数+浮点 → libffi
+#define VM_CALL_INVOKE   8   // bit 3: 此 CALL 来自 invoke（try/catch 包裹）
 
 void print_insn(const uint8_t *bc, uint32_t off);
 void hexdump(const uint8_t *bc, uint32_t size);
@@ -85,5 +93,9 @@ uintptr_t VMExecute(const uint8_t *bytecode, uint32_t size, uint32_t nregs,
                 const uintptr_t *global_init, uint32_t num_globals);
 void VMSaveReg(uintptr_t r0, uintptr_t r1, uintptr_t r2, uintptr_t r3,
                uintptr_t r4, uintptr_t r5, uintptr_t r6, uintptr_t r7);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
