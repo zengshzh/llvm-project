@@ -823,6 +823,33 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           continue;
         }
 
+        // Map LLVM memory intrinsics to their libc equivalents.
+        // Intrinsics like @llvm.memcpy cannot be called through a function pointer
+        // at runtime and would leave dangling ConstantExpr references in the function
+        // table, causing crashes in later passes (e.g. PreISelIntrinsicLowering).
+        if (Callee->isIntrinsic()) {
+          StringRef Replacement;
+          switch (Callee->getIntrinsicID()) {
+          case Intrinsic::memcpy:
+          case Intrinsic::memcpy_inline:
+            Replacement = "memcpy"; break;
+          case Intrinsic::memmove:
+            Replacement = "memmove"; break;
+          case Intrinsic::memset:
+          case Intrinsic::memset_inline:
+            Replacement = "memset"; break;
+          default:
+            report_fatal_error(
+                Twine("[VMCodeGen] unsupported intrinsic in VMP function: ") +
+                Callee->getName() + "\n");
+          }
+          // Replace with the real libc function so it can be called at runtime.
+          Callee = cast<Function>(
+              F->getParent()
+                  ->getOrInsertFunction(Replacement, CB->getFunctionType())
+                  .getCallee());
+        }
+
         unsigned NArgs = CB->arg_size();
         auto It = FuncNameMap.find(Callee->getName());
         if (It == FuncNameMap.end()) {
@@ -976,6 +1003,9 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         Value *ExcVal = cast<ResumeInst>(&I)->getValue();
         unsigned RExc = Regs.consume(ExcVal);
         emitInsn(BC, VM_RESUME, 0, RExc, 0);
+      } else if (isa<UnreachableInst>(&I)) {
+        // unreachable: this code path is dead (e.g. after __cxa_throw).
+        // Emit nothing — control flow will never reach here at runtime.
       } else {
         report_fatal_error(
             Twine("[VMCodeGen] unsupported instruction: ") +

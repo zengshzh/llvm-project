@@ -370,6 +370,7 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 | `invoke` | `INVOKE_PREP + SETARG + CALL` (flags bit3=1 表示 invoke)，正常目标 fall-through 或 `JMP` |
 | `landingpad` | `LPAD rdst`（存储序列化的 `std::exception_ptr`） |
 | `resume` | `RESUME rexc`（反序列化 `std::exception_ptr` 并 `std::rethrow_exception`） |
+| `unreachable` | 无操作（静默跳过，死代码路径在运行时不可达，如 `__cxa_throw` 之后） |
 | `extractvalue {ptr,i32}, 0` | `MOV rdst, ragg`（提取异常指针） |
 | `extractvalue {ptr,i32}, 1` | `LI rdst, 0`（cleanup-only selector 恒为 0） |
 | `insertvalue {ptr,i32}, val, idx` | `MOV rdst, rval`（传播异常句柄；仅支持 cleanup-only 模式） |
@@ -399,8 +400,9 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 
 | IR 指令 | 说明 | 依赖 |
 |---------|------|------|
-| `select` | 条件选择 | 待实现 |
-| `indirectbr` | 间接跳转 | 较少见 |
+| `unreachable` | ✅ 已支持 | 静默跳过（死代码路径，如 `__cxa_throw` 之后），不产生字节码 |
+| `select` | ❌ 条件选择 | 待实现 |
+| `indirectbr` | ❌ 间接跳转 | 较少见 |
 
 ### 异常处理（部分支持）
 
@@ -434,13 +436,15 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 
 ### 内存内联函数
 
-| IR 指令 | 说明 |
-|---------|------|
-| `lifetime.start` / `lifetime.end` | ✅ 生命周期标记（VM 中为空操作，跳过不处理） |
-| `memcpy` / `memmove` | ❌ 内存拷贝（`@llvm.memcpy.*`） |
-| `memset` | ❌ 内存设置（`@llvm.memset.*`） |
+| IR 指令 | 支持状态 | 说明 |
+|---------|---------|------|
+| `lifetime.start` / `lifetime.end` | ✅ | 生命周期标记（VM 中为空操作，跳过不处理） |
+| `memcpy` / `memmove` | ✅ | `@llvm.memcpy.*` / `@llvm.memmove.*` → 映射为 libc `memcpy` / `memmove`，通过函数表调用 |
+| `memset` | ✅ | `@llvm.memset.*` → 映射为 libc `memset`，通过函数表调用 |
 
-> 注：`@llvm.lifetime.start/end` 开启 `-O3` 后由 LLVM 自动插入，CodeGen 直接跳过不生成字节码，也不再加入函数表。
+> 注：
+> - `@llvm.lifetime.start/end` 开启 `-O3` 后由 LLVM 自动插入，CodeGen 直接跳过不生成字节码，也不再加入函数表。
+> - 内存内置函数（`@llvm.memcpy/memmove/memset`）无法在运行时通过函数指针直接调用，且其声明被放入函数表后会产生 `ConstantExpr` 引用，导致后续 `PreISelIntrinsicLowering` pass 崩溃。CodeGen 在翻译时将其替换为对应对 libc 函数名，确保函数表中始终使用真实的外部函数。
 
 ### 聚合操作
 
