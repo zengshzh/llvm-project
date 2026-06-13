@@ -238,9 +238,12 @@ static uint8_t mapICmpPred(CmpInst::Predicate Pred) {
   }
 }
 
-// One global variable referenced by the bytecode + its VM register number.
+// One global variable or function pointer referenced by the bytecode + its VM
+// register number.
 struct VMGlobalRef {
-    GlobalVariable *GV;
+    GlobalVariable *GV;  // non-null if reference is a global variable
+    Function       *Fn;  // non-null if reference is a function address (passed as
+                         // argument to another call)
     unsigned        Reg;
 };
 
@@ -289,7 +292,24 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
       unsigned reg = Regs.NextReg++;
       if (reg + 1 > Regs.MaxReg) Regs.MaxReg = reg + 1;
       It->second = reg;
-      Globals.push_back({GV, reg});
+      Globals.push_back({GV, nullptr, reg});
+    }
+    return It->second;
+  };
+
+  // Function pointer register mapping.
+  // When a Function* is passed as a call argument (e.g. operator<< with
+  // std::hex), we allocate a dedicated register, record the function, and
+  // inject its runtime address via the global_init table (same mechanism as
+  // global variables) in insertVmpcall.
+  DenseMap<Function *, unsigned> FuncPtrRegMap;
+  auto getFuncPtrReg = [&](Function *Fn) -> unsigned {
+    auto [It, New] = FuncPtrRegMap.try_emplace(Fn, 0);
+    if (New) {
+      unsigned reg = Regs.NextReg++;
+      if (reg + 1 > Regs.MaxReg) Regs.MaxReg = reg + 1;
+      It->second = reg;
+      Globals.push_back({nullptr, Fn, reg});
     }
     return It->second;
   };
@@ -906,6 +926,16 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
             // LLVM may optimise away a zero-offset GEP and use the global
             // variable directly.  Assign a global register for its address.
             RArg = getGlobalReg(GV);
+          } else if (auto *ArgFn = dyn_cast<Function>(
+                         CB->getArgOperand(i)->stripPointerCasts())) {
+            // Function pointer passed as argument (e.g. std::hex manipulator
+            // passed to operator<<).  Allocate a dedicated register and inject
+            // the function's runtime address via the global_init table.
+            RArg = getFuncPtrReg(ArgFn);
+          } else if (isa<ConstantPointerNull>(CB->getArgOperand(i))) {
+            // nullptr passed as argument → load immediate 0
+            RArg = Regs.allocRaw();
+            emitInsn(BC, VM_LI, RArg, 0, 0);
           } else {
             RArg = Regs.consume(CB->getArgOperand(i));
           }
@@ -925,6 +955,21 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         uint16_t ArgInfo = (ArgCount & 0x0F) | ((FixedCount & 0x0F) << 4)
                          | ((ArgMask & 0xFF) << 8);
         emitInsn(BC, VM_CALL, RetReg, FuncIdx, ArgInfo, CallFlags);
+
+        // Mask narrow integer returns: the callee may not zero-extend AL/AX/EAX
+        // into the full RAX register (especially for bool / i1).  Emit an AND
+        // with the appropriate mask so the VM sees a clean uintptr_t value.
+        if (RetReg && CB->getType()->isIntegerTy()) {
+          unsigned BW = CB->getType()->getIntegerBitWidth();
+          if (BW == 1)
+            emitInsn(BC, VM_AND, RetReg, RetReg, 1, VM_FLAG_IMM);
+          else if (BW == 8)
+            emitInsn(BC, VM_AND, RetReg, RetReg, 0xFF, VM_FLAG_IMM);
+          else if (BW == 16)
+            emitInsn(BC, VM_AND, RetReg, RetReg, 0xFFFF, VM_FLAG_IMM);
+          // i32 (BW==32) is implicitly zero-extended by the x86-64 ABI
+          // (mov-to-eax zeros the upper 32 bits of RAX).
+        }
 
         // Invoke-specific post-call handling:
         //   - PHI lowering for the normal destination
@@ -1185,7 +1230,11 @@ static void insertVmpcall(Function *F) {
     auto *GITy = ArrayType::get(IntPtrTy, Globals.size() * 2);
     AllocaInst *GIArr = B.CreateAlloca(GITy);
     for (size_t i = 0; i < Globals.size(); i++) {
-      Value *Addr = B.CreatePtrToInt(Globals[i].GV, IntPtrTy);
+      Value *Addr;
+      if (Globals[i].GV)
+        Addr = B.CreatePtrToInt(Globals[i].GV, IntPtrTy);
+      else
+        Addr = B.CreatePtrToInt(Globals[i].Fn, IntPtrTy);
       // Store register index
       Value *RegGEP = B.CreateInBoundsGEP(GITy, GIArr,
           {ConstantInt::get(Int32Ty, 0), ConstantInt::get(Int32Ty, (uint32_t)(i * 2))});

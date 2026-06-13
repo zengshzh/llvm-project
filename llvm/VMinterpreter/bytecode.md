@@ -604,3 +604,13 @@ void test(Results *r) {
 
 **修复：** VMCodeGen.cpp 中 CallInst 处理分支跳过这些内联函数（不生成字节码、不加入函数表），同时正确消耗操作数以维持寄存器追踪的正确性。
 
+### `Function*` 常量作为 CALL 参数时段错误 (已修复)
+当函数指针常量（如 `@_ZSt3hexRSt8ios_base`）作为另一个函数调用的参数传入时，CodeGen 的 CALL 参数处理只覆盖了 `ConstantInt`、`ConstantFP` 和 `GlobalVariable`，遗漏了 `Function` 类型。该常量落入 `Regs.consume()` 分支，因从未被映射而返回默认值 r0（通常是 sret 指针），导致被调用函数内部尝试跳转到栈地址而触发段错误。
+
+**修复：** 扩展 `VMGlobalRef` 结构体支持 `Function*`，新增 `getFuncPtrReg()` 为函数指针分配专用寄存器，复用 `global_init` 表机制通过 `ptrtoint` 在运行时注入函数地址。
+
+### 窄整数返回值（bool/operator!=）未掩码导致无限循环 (已修复)
+C++ 标准库的 `operator!=` 返回 `bool`（i1），但 VM 通过 `IntRetCallFn`（返回 `uintptr_t`）调用它。某些编译单元在返回 `bool` 时未正确零扩展 RAX 寄存器（`mov rax, [rdi]` 加载迭代器指针到高位后，`setne al` 仅设置低字节），导致 VM 读取到的返回值高位包含垃圾地址值。`BR!` 检查 `r24 != 0` 永远为真，循环无法退出。
+
+**修复：** 在 CodeGen 中，CALL 指令发出后，若返回类型为窄整数（i1/i8/i16），自动附加 `VM_AND rdst, rdst, #mask` 指令清除高位垃圾，确保 VM 看到正确的 0/1 值。
+
