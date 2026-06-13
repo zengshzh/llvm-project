@@ -614,3 +614,21 @@ C++ 标准库的 `operator!=` 返回 `bool`（i1），但 VM 通过 `IntRetCallF
 
 **修复：** 在 CodeGen 中，CALL 指令发出后，若返回类型为窄整数（i1/i8/i16），自动附加 `VM_AND rdst, rdst, #mask` 指令清除高位垃圾，确保 VM 看到正确的 0/1 值。
 
+### GEP 别名链 UseCount 追踪分裂导致寄存器被提前回收 (已修复)
+当存在"GEP 的 GEP"链且两次偏移均为 0 时（如 `GEP(GEP(%this, 0, 0), 0, 0)` — 访问结构体第一个成员数组的首元素），第二个 `aliasValue(%7, %6)` 调用时 `%6` 已经是 `%5` 的别名（UseCount 已被转移给根 `%5`），但 `aliasValue` 未沿别名链追溯到根，导致 `%7` 的 UseCount 被错误积累在中间节点 `%6` 上。`consume` 沿链追溯到根 `%5` 减计数，但中间节点 `%6` 上残留的 UseCount 从未被消耗，最终根 `%5` 的 UseCount 被多减一次提前归零，寄存器被 `LI` 立即数回收覆盖，后续使用该寄存器的 CALL 参数（如 `KeyExpansion(%5)`）读到错误值而崩溃。
+
+**修复：** `aliasValue` 在转移 UseCount 前通过 `while` 循环沿已有 `AliasParent` 链追溯到根节点，确保 UseCount 始终积累在根上，中间别名不再持有独立的 UseCount 条目。
+
+### ADD 负立即数截断导致无符号溢出死循环 (已修复)
+LLVM 在 `-O3` 下会将 `sub i32 %x, 1` 优化为 `add nsw i32 %x, -1`。CodeGen 把 `-1` 转换为 16 位立即数 `0xFFFF = 65535`，但 VM 的 `INT_BINOP` 做的是无符号加法，`13 + 65535 = 65548`，后续有符号比较 `CMP pred=6(SGT) 65548 > 0` 永远为真，循环无法退出，最终因循环索引越界访问数组导致崩溃。
+
+**修复：** 在 `case Instruction::Add` 中检查立即数的符号位（`(int16_t)(uint16_t)RSrc2 < 0`），为负时转为 `VM_SUB rdst, rsrc, #abs(val)`，利用 VM 的无符号减法正确计算 `x - (-N) = x + N`。
+
+### `consume` 过早释放寄存器导致碰撞 — GEP 与 BinaryOperator (已修复)
+**通用原则：** `consume()` 会将寄存器回收到 FreeList，而后续 `allocRaw()` 可能立即取回同一个寄存器。因此任何在 `emitInsn` 之前调用 `consume` 的模式都存在风险 —— 若 `emitInsn` 之前（或其参数准备过程中）有 `allocRaw`，可能拿到刚释放的寄存器并覆盖其值，导致后续指令读到错误数据。
+
+**修复：** 统一采用延迟消费：先用 `lookupReg` 获取寄存器号，等所有 `emitInsn` 完成后再调用 `consume` 释放。具体涉及两处：
+
+- **GEP 变量偏移：** `consume(j)` 释放 r20 → `allocRaw()` 取回 r20 → `LI r20, #4` 覆盖 `j` → `MUL r20, r20, r20` 计算 `4*4=16` 替代 `j*4`。修复：将 `allocRaw` 移至 `consume` 之前。
+- **BinaryOperator 浮点常量：** `consume(%x)` 释放 rM → `allocRaw()`（src2 为 ConstantFP 时的 LI32）取回 rM 覆盖原值 → `FADD rM, rM, rM` 两边操作数变成同一个常量。修复：非立即数操作数一律用 `lookupReg` 取号，`emitInsn` 之后再统一 `consume`。
+

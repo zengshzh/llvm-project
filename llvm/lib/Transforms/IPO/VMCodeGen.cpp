@@ -185,14 +185,22 @@ struct RegisterAllocator {
     Map[V] = ArgIdx;
   }
 
-  // Alias a GEP result to its base pointer (zero offset)
+  // Alias a GEP result to its base pointer (zero offset).
+  // Resolve through the existing alias chain so that UseCount always
+  // accumulates on the root value — otherwise a GEP-of-GEP (both
+  // zero-offset) would create a split UseCount entry on an intermediate
+  // alias, causing premature register recycling and use-after-free.
   void aliasValue(Value *Alias, Value *Target) {
+    // Walk the existing alias chain to find the root.
+    Value *Root = Target;
+    while (AliasParent.count(Root))
+      Root = AliasParent[Root];
     if (UseCount) {
-      (*UseCount)[Target] += (*UseCount)[Alias];
+      (*UseCount)[Root] += (*UseCount)[Alias];
       UseCount->erase(Alias);
     }
-    AliasParent[Alias] = Target;
-    Map[Alias] = Map[Target];
+    AliasParent[Alias] = Root;
+    Map[Alias] = Map[Root];
   }
 };
 
@@ -459,7 +467,10 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
                 Regs.freeReg(RTmp);
               }
             } else {
-              unsigned RIdx = Regs.consume(Idx);
+              // Defer consume until after emitInsn: consume() may free the
+              // register and a subsequent allocRaw() (e.g. for ElemSize LI)
+              // could recycle it, overwriting the index value.
+              unsigned RIdx = Regs.lookupReg(Idx);
               if (ElemSize == 1) {
                 emitInsn(BC, VM_ADD, RAcc, RAcc, RIdx, 0);
               } else if (ElemSize <= 0xFFFF) {
@@ -469,6 +480,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
                 emitInsn(BC, VM_ADD, RAcc, RAcc, RTmp, 0);
                 Regs.freeReg(RTmp);
               }
+              Regs.consume(Idx);
             }
           }
 
@@ -479,6 +491,7 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         // Resolve src1: handle int/float constants
         unsigned RSrc1;
         bool Src1IsConst = false;
+        Value *Src1Val = nullptr;       // non-const → deferred consume
         if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(0))) {
           RSrc1 = Regs.allocRaw();
           Src1IsConst = true;
@@ -489,12 +502,14 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           uint32_t Bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
           emitInsn32(BC, VM_LI32, RSrc1, Bits);
         } else {
-          RSrc1 = Regs.consume(BO->getOperand(0));
+          RSrc1 = Regs.lookupReg(BO->getOperand(0));
+          Src1Val = BO->getOperand(0);
         }
         // Resolve src2: int constant → IMM, float constant → LI32
         uint8_t ArithFlags = 0;
         unsigned RSrc2;
         bool Src2IsFP = false;
+        Value *Src2Val = nullptr;       // non-const → deferred consume
         if (auto *CI = dyn_cast<ConstantInt>(BO->getOperand(1))) {
           RSrc2 = static_cast<unsigned>(CI->getZExtValue());
           ArithFlags |= VM_FLAG_IMM;
@@ -504,7 +519,8 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           uint32_t Bits = CF->getValueAPF().bitcastToAPInt().getZExtValue();
           emitInsn32(BC, VM_LI32, RSrc2, Bits);
         } else {
-          RSrc2 = Regs.consume(BO->getOperand(1));
+          RSrc2 = Regs.lookupReg(BO->getOperand(1));
+          Src2Val = BO->getOperand(1);
         }
 
         unsigned RDst = Regs.alloc(&I);
@@ -513,6 +529,16 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
 
         switch (BO->getOpcode()) {
         case Instruction::Add:
+          // ADD with a negative immediate (e.g. add i32 %x, -1 → src2=0xFFFF
+          // = 65535) causes unsigned wraparound in the VM.  Convert to SUB
+          // with the absolute value so the VM's unsigned arithmetic gives
+          // the correct result.
+          if ((ArithFlags & VM_FLAG_IMM) &&
+              ((int16_t)(uint16_t)RSrc2) < 0) {
+            emitInsn(BC, VM_SUB, RDst, RSrc1,
+                     (uint16_t)(-(int16_t)(uint16_t)RSrc2), VM_FLAG_IMM);
+            break;
+          }
           emitInsn(BC, VM_ADD, RDst, RSrc1, RSrc2, ArithFlags);
           break;
         case Instruction::FAdd:
@@ -570,6 +596,12 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           report_fatal_error(StringRef(Msg));
         }
         }
+        // Deferred consume: non-constant operands are released AFTER the
+        // emitInsn so that any allocRaw() during constant resolution (e.g.
+        // ConstantFP → LI32) cannot accidentally recycle a still-needed
+        // register.
+        if (Src1Val) Regs.consume(Src1Val);
+        if (Src2Val) Regs.consume(Src2Val);
         // Free LI-allocated constant source registers
         if (Src1IsConst) Regs.freeReg(RSrc1);
         if (Src2IsFP) Regs.freeReg(RSrc2);
