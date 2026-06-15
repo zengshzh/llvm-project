@@ -370,6 +370,12 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 | `invoke` | `INVOKE_PREP + SETARG + CALL` (flags bit3=1 表示 invoke)，正常目标 fall-through 或 `JMP` |
 | `landingpad` | `LPAD rdst`（存储序列化的 `std::exception_ptr`） |
 | `resume` | `RESUME rexc`（反序列化 `std::exception_ptr` 并 `std::rethrow_exception`） |
+| `cleanuppad` | `LPAD rdst`（保存 ctx.exc 到 token 寄存器，同 landingpad 语义） |
+| `cleanupret unwind to caller` | `RESUME rexc`（重新抛出异常到调用者） |
+| `cleanupret unwind label %next` | `JMP #offset`（转发到下一个 cleanuppad，ctx.exc 保持有效） |
+| `catchswitch` | `JMP #offset`（简化调度：跳转到第一个 handler） |
+| `catchpad` | 无操作（简化模型：异常视为已捕获，仅分配 token 寄存器） |
+| `catchret` | `JMP #offset`（跳转到正常执行流，异常已处理） |
 | `unreachable` | 无操作（静默跳过，死代码路径在运行时不可达，如 `__cxa_throw` 之后） |
 | `extractvalue {ptr,i32}, 0` | `MOV rdst, ragg`（提取异常指针） |
 | `extractvalue {ptr,i32}, 1` | `LI rdst, 0`（cleanup-only selector 恒为 0） |
@@ -409,8 +415,13 @@ libffi 接管了原来由平台相关汇编跳板（`vmcall_win64.S`、`vmcall_l
 | IR 指令 | 支持状态 | 说明 |
 |---------|---------|------|
 | `invoke` | ✅ 已支持 | 翻译为 `INVOKE_PREP + SETARG + CALL` (VM_CALL_INVOKE 标志)，VM 用 try/catch 包裹调用。仅支持直接调用路径（纯 int/fp 参数）；libffi 混合参数路径的异常可能无法被捕获。 |
-| `landingpad` | 🟡 部分支持 | 仅支持 `cleanup` 类型（无 catch 子句）。`catch` 类型需要集成 `__cxa_begin_catch` / RTTI 类型匹配，暂不支持。 |
+| `landingpad` (Itanium) | ✅ 已支持 | 翻译为 `LPAD rdst`，存储序列化的 `std::exception_ptr`。cleanup-only 类型，selector 恒为 0。 |
 | `resume` | ✅ 已支持 | 翻译为 `VM_RESUME`，调用 `std::rethrow_exception()` 重新抛出异常。 |
+| `cleanuppad` (WinEH) | ✅ 已支持 | 翻译为 `LPAD rdst`（同 landingpad，保存 ctx.exc 到 token 寄存器）。详见下面的 WinEH 说明。 |
+| `cleanupret` (WinEH) | ✅ 已支持 | `unwind to caller` → `RESUME rexc`；`unwind label %next` → `JMP` 转发。 |
+| `catchswitch` (WinEH) | 🟡 简化支持 | 简化调度：直接 JMP 到第一个 handler。不支持 RTTI 分派。 |
+| `catchpad` (WinEH) | 🟡 简化支持 | 简化模型：异常视为已捕获，仅分配 token 寄存器，不发射 VM 指令。 |
+| `catchret` (WinEH) | 🟡 简化支持 | 翻译为 `JMP #offset`，跳转到正常执行流。 |
 
 ### 聚合操作（部分支持）
 

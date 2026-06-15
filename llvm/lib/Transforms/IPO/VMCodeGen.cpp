@@ -853,6 +853,20 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           emitInsn(BC, VM_JMP, 0, 0, 0);
           Patches.push_back({JmpStart, DefaultBB, false});
         }
+      } else if (auto *CSI = dyn_cast<CatchSwitchInst>(&I)) {
+        // WinEH catchswitch: simplified dispatch - JMP to the first handler.
+        // Consume parent pad if it's an Instruction (not ConstantTokenNone).
+        if (isa<Instruction>(CSI->getParentPad()))
+          Regs.consume(CSI->getParentPad());
+        if (CSI->getNumHandlers() > 0) {
+          BasicBlock *FirstHandler = *CSI->handler_begin();
+          if (BBOrder[FirstHandler] != BBOrder[&BB] + 1) {
+            unsigned InstrStart = BC.size();
+            emitInsn(BC, VM_JMP, 0, 0, 0);
+            Patches.push_back({InstrStart, FirstHandler, false});
+          }
+        }
+        // No handlers means no-op (corresponds to noexcept semantics).
       } else if (auto *CB = dyn_cast<CallBase>(&I)) {
         // CallBrInst (asm goto) is not supported
         if (isa<CallBrInst>(CB))
@@ -871,6 +885,15 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           for (Value *Op : I.operands()) {
             if (isa<Instruction>(Op) || isa<Argument>(Op))
               Regs.consume(Op);
+          }
+          // Also consume funclet operand bundle tokens for use-count correctness.
+          if (CB->hasOperandBundles()) {
+            if (auto Bundle = CB->getOperandBundle(LLVMContext::OB_funclet)) {
+              for (auto &Input : Bundle->Inputs) {
+                if (auto *I = dyn_cast<Instruction>(Input.get()))
+                  Regs.consume(I);
+              }
+            }
           }
           continue;
         }
@@ -1003,6 +1026,19 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
           // (mov-to-eax zeros the upper 32 bits of RAX).
         }
 
+        // Consume funclet operand bundle tokens for use-count correctness.
+        // In the VM, funclet bundles are structural markers and have no
+        // runtime effect, but the token register must be consumed so that
+        // register lifetime tracking does not leak it.
+        if (CB->hasOperandBundles()) {
+          if (auto Bundle = CB->getOperandBundle(LLVMContext::OB_funclet)) {
+            for (auto &Input : Bundle->Inputs) {
+              if (auto *I = dyn_cast<Instruction>(Input.get()))
+                Regs.consume(I);
+            }
+          }
+        }
+
         // Invoke-specific post-call handling:
         //   - PHI lowering for the normal destination
         //   - JMP to normal destination if not fall-through
@@ -1036,6 +1072,20 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         // for cleanup landingpads and is handled by extractvalue → VM_LI 0.
         // The unwind path is dead in normal execution; LPAD is only reached
         // when an exception was caught by VM_CALL INVOKE.
+        unsigned RDst = Regs.alloc(&I);
+        emitInsn(BC, VM_LPAD, RDst, 0, 0);
+      } else if (isa<CleanupPadInst>(&I)) {
+        // cleanuppad is the WinEH equivalent of landingpad.  At the VM level
+        // it does the same thing: save ctx.exc (the serialized
+        // std::exception_ptr) into the token register via VM_LPAD.
+        auto *CPI = cast<CleanupPadInst>(&I);
+        // Consume parent pad if it's an Instruction (ConstantTokenNone is ok).
+        if (isa<Instruction>(CPI->getParentPad()))
+          Regs.consume(CPI->getParentPad());
+        // Consume additional args.
+        for (unsigned i = 0; i < CPI->arg_size(); i++)
+          if (isa<Instruction>(CPI->getArgOperand(i)))
+            Regs.consume(CPI->getArgOperand(i));
         unsigned RDst = Regs.alloc(&I);
         emitInsn(BC, VM_LPAD, RDst, 0, 0);
       } else if (auto *EVI = dyn_cast<ExtractValueInst>(&I)) {
@@ -1080,6 +1130,44 @@ static unsigned genBytecode(Function *F, std::vector<uint8_t> &BC,
         Value *ExcVal = cast<ResumeInst>(&I)->getValue();
         unsigned RExc = Regs.consume(ExcVal);
         emitInsn(BC, VM_RESUME, 0, RExc, 0);
+      } else if (auto *CRI = dyn_cast<CleanupReturnInst>(&I)) {
+        // cleanupret from %token:
+        //   unwind to caller       -> VM_RESUME (rethrow)
+        //   unwind label %nextpad  -> JMP (ctx.exc stays valid for next LPAD)
+        CleanupPadInst *CPad = CRI->getCleanupPad();
+        unsigned RExc = Regs.consume(CPad);
+        if (CRI->unwindsToCaller()) {
+          emitInsn(BC, VM_RESUME, 0, RExc, 0);
+        } else {
+          BasicBlock *NextPad = CRI->getUnwindDest();
+          if (BBOrder[NextPad] != BBOrder[&BB] + 1) {
+            unsigned InstrStart = BC.size();
+            emitInsn(BC, VM_JMP, 0, 0, 0);
+            Patches.push_back({InstrStart, NextPad, false});
+          }
+        }
+      } else if (isa<CatchPadInst>(&I)) {
+        // catchpad is entered when an exception is caught.  In our simplified
+        // model the exception is considered "handled" without RTTI dispatch.
+        // Just allocate the token register and consume the operands.
+        auto *CPI = cast<CatchPadInst>(&I);
+        if (isa<Instruction>(CPI->getParentPad()))
+          Regs.consume(CPI->getParentPad());
+        for (unsigned i = 0; i < CPI->arg_size(); i++)
+          if (isa<Instruction>(CPI->getArgOperand(i)))
+            Regs.consume(CPI->getArgOperand(i));
+        unsigned RDst = Regs.alloc(&I);
+        // No VM instruction emitted: catchpad is a no-op in our model.
+      } else if (auto *CRI = dyn_cast<CatchReturnInst>(&I)) {
+        // catchret from %catchpad to label %normal:
+        // exception was handled, resume normal flow at the catchret target.
+        Regs.consume(CRI->getCatchPad());
+        BasicBlock *Target = CRI->getSuccessor();
+        if (BBOrder[Target] != BBOrder[&BB] + 1) {
+          unsigned InstrStart = BC.size();
+          emitInsn(BC, VM_JMP, 0, 0, 0);
+          Patches.push_back({InstrStart, Target, false});
+        }
       } else if (isa<UnreachableInst>(&I)) {
         // unreachable: this code path is dead (e.g. after __cxa_throw).
         // Emit nothing — control flow will never reach here at runtime.
