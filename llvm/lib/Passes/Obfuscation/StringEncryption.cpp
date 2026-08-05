@@ -21,6 +21,13 @@ bool StringEncryptionPass::do_StrEnc(Module &M, ModuleAnalysisManager &AM) {
       continue;
     if (ConstantDataSequential *CDS = dyn_cast<ConstantDataSequential>(Init)) {
       if (CDS->isCString()) {
+        // Skip RTTI/typeinfo-related globals to avoid corrupting exception
+        // handling. These have names like _ZTS*/_ZTI*/_ZTV* (Itanium ABI).
+        StringRef GVName = GV.getName();
+        if (GVName.starts_with("_ZTS") || GVName.starts_with("_ZTI") ||
+            GVName.starts_with("_ZTV")) {
+          continue;
+        }
         CSPEntry *Entry = new CSPEntry();
         StringRef Data = CDS->getRawDataValues();
         Entry->Data.reserve(Data.size());
@@ -320,6 +327,47 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
         DecryptedGV; // if GV has multiple use in a block, decrypt only at the
                      // first use
     bool Changed = false;
+
+    // Helper: trace through GEP and bitcast to find the underlying GlobalVariable
+    auto getUnderlyingGV = [](Value *V) -> GlobalVariable * {
+      while (true) {
+        if (auto *GV = dyn_cast<GlobalVariable>(V))
+          return GV;
+        if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+          V = GEP->getPointerOperand();
+          continue;
+        }
+        if (auto *BC = dyn_cast<BitCastOperator>(V)) {
+          V = BC->getOperand(0);
+          continue;
+        }
+        return nullptr;
+      }
+    };
+
+    // Helper: find the instruction closest to the GV in a GEP/bitcast chain
+    auto findFirstUseInst = [](Value *V, GlobalVariable *GV) -> Instruction * {
+      while (true) {
+        if (V == GV)
+          return nullptr;
+        if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+          Value *PtrOp = GEP->getPointerOperand();
+          if (PtrOp == GV)
+            return dyn_cast<Instruction>(V);
+          V = PtrOp;
+          continue;
+        }
+        if (auto *BC = dyn_cast<BitCastOperator>(V)) {
+          Value *SrcOp = BC->getOperand(0);
+          if (SrcOp == GV)
+            return dyn_cast<Instruction>(V);
+          V = SrcOp;
+          continue;
+        }
+        return nullptr;
+      }
+    };
+
     for (BasicBlock &BB : *F) {
         DecryptedGV.clear();
         if (BB.isEHPad()) {
@@ -379,7 +427,14 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
             } else {
                 for (User::op_iterator op = Inst.op_begin();
                      op != Inst.op_end(); ++op) {
-                    if (GlobalVariable *GV = dyn_cast<GlobalVariable>(*op)) {
+                    GlobalVariable *GV = dyn_cast<GlobalVariable>(*op);
+                    if (!GV) {
+                      // Trace through GEP/bitcast chain to find underlying GV
+                      if (isa<Instruction>(*op) || isa<ConstantExpr>(*op)) {
+                        GV = getUnderlyingGV(*op);
+                      }
+                    }
+                    if (GV) {
                         auto Iter1 = CSPEntryMap.find(GV);
                         auto Iter2 = CSUserMap.find(GV);
                         if (Iter2 != CSUserMap.end()) {
@@ -387,9 +442,13 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
                         if (DecryptedGV.count(GV) > 0) {
                             Inst.replaceUsesOfWith(GV, User->DecGV);
                         } else {
-                            IRBuilder<> IRB(&Inst);
+                            Instruction *ChainInst = findFirstUseInst(*op, GV);
+                            Instruction *InsertBefore = ChainInst ? ChainInst : &Inst;
+                            IRBuilder<> IRB(InsertBefore);
                             IRB.CreateCall(User->InitFunc, {User->DecGV});
                             Inst.replaceUsesOfWith(GV, User->DecGV);
+                            if (ChainInst)
+                              ChainInst->replaceUsesOfWith(GV, User->DecGV);
                             MaybeDeadGlobalVars.insert(GV);
                             DecryptedGV.insert(GV);
                             Changed = true;
@@ -399,7 +458,9 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
                         if (DecryptedGV.count(GV) > 0) {
                             Inst.replaceUsesOfWith(GV, Entry->DecGV);
                         } else {
-                            IRBuilder<> IRB(&Inst);
+                            Instruction *ChainInst = findFirstUseInst(*op, GV);
+                            Instruction *InsertBefore = ChainInst ? ChainInst : &Inst;
+                            IRBuilder<> IRB(InsertBefore);
 
                             Value *OutBuf = IRB.CreateBitCast(Entry->DecGV, IRB.getPtrTy());
                             Value *Data = IRB.CreateInBoundsGEP(
@@ -409,6 +470,8 @@ bool StringEncryptionPass::processConstantStringUse(Function *F) {
                             IRB.CreateCall(Entry->DecFunc, {OutBuf, Data});
 
                             Inst.replaceUsesOfWith(GV, Entry->DecGV);
+                            if (ChainInst)
+                              ChainInst->replaceUsesOfWith(GV, Entry->DecGV);
                             MaybeDeadGlobalVars.insert(GV);
                             DecryptedGV.insert(GV);
                             Changed = true;
@@ -435,6 +498,11 @@ void StringEncryptionPass::collectConstantStringUser(
         Visited.insert(V);
         for (Value *User : V->users()) {
             if (auto *GV = dyn_cast<GlobalVariable>(User)) {
+                // Skip RTTI/typeinfo-related globals
+                StringRef GVName = GV->getName();
+                if (GVName.starts_with("_ZTS") || GVName.starts_with("_ZTI") ||
+                    GVName.starts_with("_ZTV"))
+                  continue;
                 Users.insert(GV);
             } else {
                 ToVisit.push_back(User);

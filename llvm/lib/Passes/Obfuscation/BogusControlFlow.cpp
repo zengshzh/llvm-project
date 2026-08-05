@@ -265,8 +265,8 @@ void BogusControlFlowPass::addBogusFlow(BasicBlock *basicBlock, Function &F) {
   // part, because they actually are updated in the second part according to
   // them.
   BasicBlock::iterator i1 = basicBlock->begin();
-  if (basicBlock->getFirstNonPHIOrDbgOrLifetime() != basicBlock->end())
-    i1 = (BasicBlock::iterator)basicBlock->getFirstNonPHIOrDbgOrLifetime();
+  if (Instruction *firstNonPHI = basicBlock->getFirstNonPHIOrDbgOrLifetime())
+    i1 = firstNonPHI->getIterator();
   Twine *var;
   var = new Twine("originalBB");
   BasicBlock *originalBB = basicBlock->splitBasicBlock(i1, *var);
